@@ -7,6 +7,7 @@ import { escapeDriveQuery, isTextMime, ALL_DRIVES_LIST_PARAMS } from '../utils.j
 import { downloadTextContent, writeTextContent } from './text-content.js';
 import { uploadImageToDrive } from '../utils/driveImageUpload.js';
 import { withRetry } from '../utils/retry.js';
+import { registerArtifact } from '../resourceHook.js';
 
 // ---------------------------------------------------------------------------
 // Helper functions
@@ -2416,6 +2417,10 @@ export async function handleTool(toolName: string, args: Record<string, unknown>
         };
       }
 
+      registerArtifact({
+        provider: "google_docs", provider_ref: doc.id!, kind: "doc",
+        title: doc.name ?? a.name, uri: doc.webViewLink ?? `https://docs.google.com/document/d/${doc.id}/edit`,
+      });
       return {
         content: [{ type: "text", text: `Created Google Doc: ${doc.name}\nID: ${doc.id}\nLink: ${doc.webViewLink}` }],
         isError: false
@@ -2473,6 +2478,10 @@ export async function handleTool(toolName: string, args: Record<string, unknown>
       }
 
       const newDoc = fileResponse.data;
+      registerArtifact({
+        provider: "google_docs", provider_ref: newDoc.id!, kind: "doc",
+        title: newDoc.name ?? a.name, uri: newDoc.webViewLink ?? `https://docs.google.com/document/d/${newDoc.id}/edit`,
+      });
       return {
         content: [{ type: "text", text: `Created Google Doc from HTML: ${newDoc.name}\nID: ${newDoc.id}\nLink: ${newDoc.webViewLink}` }],
         isError: false
