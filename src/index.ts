@@ -30,6 +30,7 @@ import {
 import type { AccountRecord, RedactedAccountView } from './auth/types.js';
 import { ALIAS_PATTERN, RESERVED_ALIASES } from './auth/types.js';
 import { resolveAddAccountScopes } from './auth/scopes.js';
+import { resolveArgs, wrapResult } from './circuitBuffer.js';
 import { fetchUserInfo } from './auth/userInfo.js';
 import { fileURLToPath } from 'url';
 import { readFileSync } from 'fs';
@@ -770,16 +771,20 @@ function createMcpServer(config: RuntimeConfig = runtimeConfig): Server {
       let ctx: ToolContext;
       let toolArgs: Record<string, unknown>;
 
+      // Circuit cache: expand any @@hN@@ slug in the args back into its payload BEFORE validation/dispatch.
+      // A thrown CircuitError (unknown/expired slug) is caught below and returned as an error result.
+      const args = await resolveArgs(rawArgs);
+
       if (ADMIN_TOOLS.has(toolName)) {
         // Admin tools operate on system-wide state; they run with the default
         // account's context for back-compat but ignore any `account` arg. Tolerate
         // a missing/unusable default so manage_accounts still works with zero
         // accounts or a revoked default (its handlers only touch accountOps).
         ctx = await buildToolContext(sessionId, undefined, { tolerateClientFailure: true });
-        toolArgs = rawArgs;
+        toolArgs = args;
       } else {
         const meta = TOOL_META[toolName] ?? FALLBACK_META;
-        const accountArg = normalizeAccountArg(rawArgs.account);
+        const accountArg = normalizeAccountArg(args.account);
         const sys = requireAuthSystem();
         const targeting = await sys.resolver.resolve(accountArg, meta.opKind, {
           sessionId,
@@ -796,12 +801,13 @@ function createMcpServer(config: RuntimeConfig = runtimeConfig): Server {
         }
         const account = targeting.accounts[0];
         ctx = await buildToolContext(sessionId, account);
-        toolArgs = stripAccountArg(rawArgs);
+        toolArgs = stripAccountArg(args);
       }
 
       for (const mod of domainModules) {
         const result = await mod.handleTool(toolName, toolArgs, ctx);
-        if (result !== null) return result;
+        // Park a large result + prepend its slug so the next tool can wire it instead of retyping.
+        if (result !== null) return await wrapResult(result);
       }
       return errorResponse('Tool not found');
     } catch (error) {
