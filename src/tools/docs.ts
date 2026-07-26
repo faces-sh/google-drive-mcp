@@ -9,6 +9,38 @@ import { uploadImageToDrive } from '../utils/driveImageUpload.js';
 import { withRetry } from '../utils/retry.js';
 import { registerArtifact } from '../resourceHook.js';
 
+// Deterministic loop-breaker for a small dispatcher model. Observed failure: getGoogleDocContent called 4x
+// with byte-identical args AND results, no edit in between, the model spins on re-reading instead of acting.
+// Cap identical CONTENT READS of one document within a short window; the (CAP+1)th returns a firm nudge to
+// act instead of the content the model already has. Any WRITE to that doc resets the counter, so a genuine
+// read -> edit -> verify still works, and a read a minute later (a fresh turn) is content again. Per server
+// process (one per session), so sessions never interfere.
+const READ_GUARD_TOOLS = new Set<string>([
+  'getGoogleDocContent', 'getGoogleDocContentPaginated', 'readGoogleDoc', 'readGoogleDocPaginated',
+  'readSmartChips', 'listDocumentTabs', 'getDocumentInfo',
+]);
+const READ_GUARD_WINDOW_MS = 90_000;
+const READ_GUARD_CAP = 2;
+const _readGuard = new Map<string, number[]>();
+
+function guardRead(docId: string): string | null {
+  const now = Date.now();
+  const times = (_readGuard.get(docId) || []).filter((t) => now - t < READ_GUARD_WINDOW_MS);
+  if (times.length >= READ_GUARD_CAP) {
+    _readGuard.set(docId, times); // don't count the refused read
+    return `You have already read this document ${times.length} times in the last minute with no edits in ` +
+      `between, and its content has not changed. You already have it, do NOT read it again: make your edit ` +
+      `now (e.g. findAndReplaceInDoc or insertText), or say what is blocking you.`;
+  }
+  times.push(now);
+  _readGuard.set(docId, times);
+  return null;
+}
+
+function invalidateReadGuard(docId: string): void {
+  _readGuard.delete(docId);
+}
+
 // ---------------------------------------------------------------------------
 // Helper functions
 // ---------------------------------------------------------------------------
@@ -2324,6 +2356,18 @@ export const toolDefinitions: ToolDefinition[] = [
 // ---------------------------------------------------------------------------
 
 export async function handleTool(toolName: string, args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult | null> {
+  // Loop-breaker: cap repeated identical content-reads of one doc; reset the counter on any other op (a
+  // write/format/comment on the doc means the next read is legitimately fresh). Applied centrally so it
+  // covers every read path in this module.
+  const _docId = typeof args.documentId === 'string' ? (args.documentId as string) : undefined;
+  if (_docId) {
+    if (READ_GUARD_TOOLS.has(toolName)) {
+      const nudge = guardRead(_docId);
+      if (nudge) return { content: [{ type: 'text', text: nudge }], isError: false };
+    } else {
+      invalidateReadGuard(_docId);
+    }
+  }
   switch (toolName) {
 
     // =========================================================================
