@@ -2441,9 +2441,35 @@ export async function handleTool(toolName: string, args: Record<string, unknown>
   if (!docId) return handleToolInner(toolName, args, ctx);
   if (!READ_GUARD_TOOLS.has(toolName)) {
     invalidateReadGuard(docId);
-    return handleToolInner(toolName, args, ctx);
+    const result = await handleToolInner(toolName, args, ctx);
+    if (DOC_WRITE_TOOLS.has(toolName) && result && !result.isError) registerWrittenDoc(docId, result);
+    return result;
   }
   return guardRead(docId, readKey(toolName, args), await handleToolInner(toolName, args, ctx));
+}
+
+/** Docs tools that CHANGE a document. A create registers at its own site (it learns the id from Drive);
+ *  these already have the id in hand, as the argument they were called with. */
+const DOC_WRITE_TOOLS = new Set<string>(['updateGoogleDoc', 'insertText', 'findAndReplaceInDoc']);
+
+/**
+ * File the document a write just changed, so an existing doc the agent edits becomes a workspace resource
+ * rather than only the ones it created.
+ *
+ * The IDENTITY is structured throughout: the id is the argument the caller passed, and the link is derived
+ * from it. Only the TITLE is read out of the sentence, and it is a label. Maestro used to recover the id
+ * this way too, by regexing this tool's prose (`ResourceExtractor`), which means a reword here silently
+ * stopped filing a user's documents and nothing failed (faces-sh/faced#283). A reword can now cost a
+ * document its nice name, never its existence.
+ */
+function registerWrittenDoc(docId: string, result: ToolResult): void {
+  const text = result.content?.map((c: any) => (typeof c?.text === 'string' ? c.text : '')).join('\n') ?? '';
+  const named = /Updated Google Doc:\s*(.+)/.exec(text)?.[1]?.trim().replace(/\s*\(tab:.*\)$/, '');
+  registerArtifact({
+    provider: 'google_docs', provider_ref: docId, kind: 'doc',
+    title: named && named.length > 0 ? named : 'Google Doc',
+    uri: `https://docs.google.com/document/d/${docId}/edit`,
+  });
 }
 
 async function handleToolInner(toolName: string, args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult | null> {

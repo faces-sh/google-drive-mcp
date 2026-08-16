@@ -2,6 +2,7 @@ import { z } from 'zod';
 import type { sheets_v4 } from 'googleapis';
 import type { ToolDefinition, ToolResult, ToolContext } from '../types.js';
 import { errorResponse } from '../types.js';
+import { registerArtifact } from '../resourceHook.js';
 import { parseA1Range, convertA1ToGridRange, escapeDriveQuery, ALL_DRIVES_LIST_PARAMS, type GridRange } from '../utils.js';
 
 // ---------------------------------------------------------------------------
@@ -757,7 +758,44 @@ async function batchUpdateOne(
 // Handler
 // ---------------------------------------------------------------------------
 
+/** Sheets tools that CHANGE a spreadsheet. `createGoogleSheet` registers at its own site, where it learns
+ *  the id from the API; every one of these already has it, as a required argument. */
+const SHEET_WRITE_TOOLS = new Set<string>([
+  'updateGoogleSheet', 'appendSpreadsheetRows', 'addSheet', 'addSpreadsheetSheet', 'renameSheet',
+]);
+
+/**
+ * File the spreadsheet a write just changed, so a sheet the agent edits becomes a workspace resource and
+ * not only the ones it created.
+ *
+ * Identity is structured: the id is the `spreadsheetId` argument this call was required to carry, and the
+ * link is derived from it. Nothing here reads the result text, because a sheet write result does not name
+ * the file. Maestro used to recover the id by regexing this tool's prose, so a reword silently stopped
+ * filing a user's spreadsheets and nothing failed (faces-sh/faced#283).
+ */
+function registerWrittenSheet(sheetId: string): void {
+  registerArtifact({
+    provider: 'google_sheets', provider_ref: sheetId, kind: 'sheet',
+    title: 'Google Sheet',
+    uri: `https://docs.google.com/spreadsheets/d/${sheetId}/edit`,
+  });
+}
+
 export async function handleTool(
+  toolName: string,
+  args: Record<string, unknown>,
+  ctx: ToolContext
+): Promise<ToolResult | null> {
+  const sheetId = typeof args.spreadsheetId === 'string' ? args.spreadsheetId : undefined;
+  if (sheetId && SHEET_WRITE_TOOLS.has(toolName)) {
+    const result = await handleToolInner(toolName, args, ctx);
+    if (result && !result.isError) registerWrittenSheet(sheetId);
+    return result;
+  }
+  return handleToolInner(toolName, args, ctx);
+}
+
+async function handleToolInner(
   toolName: string,
   args: Record<string, unknown>,
   ctx: ToolContext
@@ -815,6 +853,13 @@ export async function handleTool(
         requestBody: { values: a.data }
       });
 
+      // The spreadsheet exists now, so file it now, from the id the API just gave us. Until this line,
+      // sheet creation was filed ONLY by Maestro regexing the sentence below (faces-sh/faced#283).
+      registerArtifact({
+        provider: "google_sheets", provider_ref: spreadsheet.data.spreadsheetId!, kind: "sheet",
+        title: a.name,
+        uri: `https://docs.google.com/spreadsheets/d/${spreadsheet.data.spreadsheetId}/edit`,
+      });
       return {
         content: [{ type: "text", text: `Created Google Sheet: ${a.name}\nID: ${spreadsheet.data.spreadsheetId}` }],
         isError: false

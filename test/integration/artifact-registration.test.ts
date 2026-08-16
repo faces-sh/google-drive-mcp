@@ -94,4 +94,49 @@ describe('artifact registration', () => {
     await settle();
     assert.equal(received.length, 1, 'moving registration earlier must not double-register');
   });
+  it('registers a document that a write tool changed', async () => {
+    ctx.mocks.docs.service.documents.get._setImpl(async () => ({
+      data: { documentId: 'doc-upd-1', title: 'An existing doc',
+              body: { content: [{ paragraph: { elements: [{ textRun: { content: 'old\n' } }] } }] } },
+    }));
+    ctx.mocks.docs.service.documents.batchUpdate._setImpl(async () => ({ data: {} }));
+
+    const res = await callTool(ctx.client, 'updateGoogleDoc', { documentId: 'doc-upd-1', content: 'new body' });
+    assert.equal(res.isError, false);
+
+    await settle();
+    assert.equal(received.length, 1, 'editing a doc the agent did not create must still file it');
+    assert.equal(received[0].envelope.provider_ref, 'doc-upd-1', 'the id comes from the ARGUMENT, not the prose');
+    assert.equal(received[0].envelope.uri, 'https://docs.google.com/document/d/doc-upd-1/edit');
+    assert.equal(received[0].envelope.title, 'An existing doc');
+  });
+
+  /** A reword may cost the label, never the identity: that is the whole point of taking the id from args.
+   *
+   * `findAndReplaceInDoc` is the case Maestro's own extractor table missed entirely, while listing an
+   * `appendToGoogleDoc` this server does not have. Editing a document that way filed nothing.
+   */
+  it('files a document edited by find-and-replace, which names no document in its result', async () => {
+    ctx.mocks.docs.service.documents.batchUpdate._setImpl(async () => ({
+      data: { replies: [{ replaceAllText: { occurrencesChanged: 2 } }] },
+    }));
+
+    const res = await callTool(ctx.client, 'findAndReplaceInDoc',
+                               { documentId: 'doc-far-1', findText: 'old', replaceText: 'new' });
+    assert.equal(res.isError, false, `precondition: ${JSON.stringify(res.content?.[0]?.text)}`);
+
+    await settle();
+    assert.equal(received.length, 1, 'an edit is a change, so the document it changed must be filed');
+    assert.equal(received[0].envelope.provider_ref, 'doc-far-1');
+  });
+
+  it('does not file a document whose write failed', async () => {
+    ctx.mocks.docs.service.documents.get._setImpl(async () => {
+      const e: any = new Error('not found'); e.code = 404; throw e;
+    });
+    await callTool(ctx.client, 'updateGoogleDoc', { documentId: 'doc-upd-3', content: 'x' });
+
+    await new Promise((r) => setTimeout(r, 120));
+    assert.equal(received.length, 0, 'a write that failed changed nothing, so there is nothing to file');
+  });
 });
