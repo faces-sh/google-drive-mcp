@@ -2494,6 +2494,15 @@ async function handleToolInner(toolName: string, args: Record<string, unknown>, 
       }
       const doc = docResponse.data;
 
+      // The document EXISTS now, so register it now, before anything is put in it. Filling it can fail
+      // (see the catch below) and that leaves a real, empty document in the user's Drive; one Maestro was
+      // never told about is one they cannot find again. Registration says "this exists", which became true
+      // here, not "this was filled in successfully".
+      registerArtifact({
+        provider: "google_docs", provider_ref: doc.id!, kind: "doc",
+        title: doc.name ?? a.name, uri: doc.webViewLink ?? `https://docs.google.com/document/d/${doc.id}/edit`,
+      });
+
       const docs = ctx.google.docs({ version: 'v1', auth: ctx.authClient });
 
       // A blank document is finished the moment Drive creates it; there is nothing to insert.
@@ -2524,10 +2533,6 @@ async function handleToolInner(toolName: string, args: Record<string, unknown>, 
         };
       }
 
-      registerArtifact({
-        provider: "google_docs", provider_ref: doc.id!, kind: "doc",
-        title: doc.name ?? a.name, uri: doc.webViewLink ?? `https://docs.google.com/document/d/${doc.id}/edit`,
-      });
       return {
         content: [{ type: "text", text: `Created Google Doc: ${doc.name}\nID: ${doc.id}\nLink: ${doc.webViewLink}` }],
         isError: false
