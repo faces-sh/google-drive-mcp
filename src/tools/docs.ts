@@ -50,6 +50,38 @@ function invalidateReadGuard(docId: string): void {
 // mid-download) and re-checked against the buffer as a backstop.
 const MAX_IMAGE_BYTES = 40 * 1024 * 1024;
 
+/**
+ * The requests that place `text` at the top of a document body, styled as normal text.
+ *
+ * Empty content is a legal ask: "make me a blank doc called X", or clearing a doc by updating it
+ * to "". Google rejects an insertText carrying no text ("Invalid requests[0].insertText: Insert
+ * text requests must specify text"), and an updateParagraphStyle over the empty range 1..1 says
+ * nothing either. So empty text yields NO requests, and the caller skips the batch rather than
+ * sending one that is certain to fail.
+ *
+ * Pure, so the empty case is testable without a Google client.
+ */
+export function bodyTextRequests(text: string, tabId?: string): any[] {
+  if (text.length === 0) return [];
+  return [
+    {
+      insertText: {
+        location: tabId ? { index: 1, tabId } : { index: 1 },
+        text,
+      }
+    },
+    {
+      updateParagraphStyle: {
+        range: tabId
+          ? { startIndex: 1, endIndex: text.length + 1, tabId }
+          : { startIndex: 1, endIndex: text.length + 1 },
+        paragraphStyle: { namedStyleType: 'NORMAL_TEXT' },
+        fields: 'namedStyleType'
+      }
+    },
+  ];
+}
+
 // Pure helper – no context needed
 function hexToRgbColor(hex: string): { red: number; green: number; blue: number } | null {
   if (!hex) return null;
@@ -2417,31 +2449,15 @@ export async function handleTool(toolName: string, args: Record<string, unknown>
 
       const docs = ctx.google.docs({ version: 'v1', auth: ctx.authClient });
 
+      // A blank document is finished the moment Drive creates it; there is nothing to insert.
+      const requests = bodyTextRequests(a.content);
+
       try {
-        await withRetry(
+        if (requests.length > 0) await withRetry(
           (signal) => docs.documents.batchUpdate(
             {
               documentId: doc.id!,
-              requestBody: {
-                requests: [
-                  {
-                    insertText: { location: { index: 1 }, text: a.content }
-                  },
-                  // Ensure the text is formatted as normal text, not as a header
-                  {
-                    updateParagraphStyle: {
-                      range: {
-                        startIndex: 1,
-                        endIndex: a.content.length + 1
-                      },
-                      paragraphStyle: {
-                        namedStyleType: 'NORMAL_TEXT'
-                      },
-                      fields: 'namedStyleType'
-                    }
-                  }
-                ]
-              }
+              requestBody: { requests }
             },
             { signal }
           ),
@@ -2562,18 +2578,10 @@ export async function handleTool(toolName: string, args: Record<string, unknown>
             }
           });
         }
-        requests.push({
-          insertText: { location: { index: 1, tabId: a.tabId }, text: a.content }
-        });
-        requests.push({
-          updateParagraphStyle: {
-            range: { startIndex: 1, endIndex: a.content.length + 1, tabId: a.tabId },
-            paragraphStyle: { namedStyleType: 'NORMAL_TEXT' },
-            fields: 'namedStyleType'
-          }
-        });
+        // Empty content clears the tab: the delete above is the whole edit.
+        requests.push(...bodyTextRequests(a.content, a.tabId));
 
-        await docs.documents.batchUpdate({
+        if (requests.length > 0) await docs.documents.batchUpdate({
           documentId: a.documentId,
           requestBody: { requests }
         });
@@ -2603,28 +2611,11 @@ export async function handleTool(toolName: string, args: Record<string, unknown>
         });
       }
 
-      // Insert new content
-      await docs.documents.batchUpdate({
+      // Insert new content. Empty content clears the doc: the delete above was the whole edit.
+      const requests = bodyTextRequests(a.content);
+      if (requests.length > 0) await docs.documents.batchUpdate({
         documentId: a.documentId,
-        requestBody: {
-          requests: [
-            {
-              insertText: { location: { index: 1 }, text: a.content }
-            },
-            {
-              updateParagraphStyle: {
-                range: {
-                  startIndex: 1,
-                  endIndex: a.content.length + 1
-                },
-                paragraphStyle: {
-                  namedStyleType: 'NORMAL_TEXT'
-                },
-                fields: 'namedStyleType'
-              }
-            }
-          ]
-        }
+        requestBody: { requests }
       });
 
       return {
