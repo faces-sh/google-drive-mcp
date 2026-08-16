@@ -8,6 +8,7 @@ import { downloadTextContent, writeTextContent } from './text-content.js';
 import { uploadImageToDrive } from '../utils/driveImageUpload.js';
 import { withRetry } from '../utils/retry.js';
 import { registerArtifact } from '../resourceHook.js';
+import { createHash } from 'node:crypto';
 
 // Deterministic loop-breaker for a small dispatcher model. Observed failure: getGoogleDocContent called 4x
 // with byte-identical args AND results, no edit in between, the model spins on re-reading instead of acting.
@@ -21,20 +22,63 @@ const READ_GUARD_TOOLS = new Set<string>([
 ]);
 const READ_GUARD_WINDOW_MS = 90_000;
 const READ_GUARD_CAP = 2;
-const _readGuard = new Map<string, number[]>();
+/** docId -> (what the read WAS -> what it RETURNED, and when). Nested so a write clears a whole document. */
+const _readGuard = new Map<string, Map<string, { hash: string; times: number[] }>>();
 
-function guardRead(docId: string): string | null {
+/** A cheap fingerprint of what a read returned, so "the answer has not changed" can be checked, not assumed. */
+function resultHash(result: ToolResult | null): string {
+  return createHash('sha1').update(JSON.stringify(result?.content ?? null)).digest('hex');
+}
+
+/**
+ * What makes two reads THE SAME read: the tool, and every argument that shapes what comes back.
+ *
+ * Keying on `documentId` alone was wrong, and wrong in the direction that hurts. Tab A, tab B and tab C of
+ * one document are three different reads; so are the same doc as `text` and as `markdown`, and so is
+ * `listDocumentTabs` next to a content read. Counting them as one meant the third refused a model that was
+ * doing exactly the right thing, and told it "you already have it" about content it had never seen. A
+ * three-tab document could not be read through at all.
+ *
+ * Comparing the whole argument set needs no per-tool knowledge and cannot drift as tools gain options: a
+ * read that differs in any way it can differ is a different read.
+ */
+export function readKey(toolName: string, args: Record<string, unknown>): string {
+  const shape = Object.keys(args).sort().map((k) => `${k}=${JSON.stringify(args[k])}`).join('&');
+  return `${toolName}(${shape})`;
+}
+
+/**
+ * The read has already run. Hand back its result, unless this is the (CAP+1)th time the SAME request has
+ * returned the SAME answer inside the window, in which case say so instead.
+ *
+ * Deciding AFTER the call rather than before is the whole point. The nudge asserts "the answer has not
+ * changed", and only a performed read can know that. A document is a shared thing: the person can edit it
+ * in their browser between two reads, and refusing the second on the assumption that nothing moved tells
+ * the model something false about the world. This costs no extra API call, because the read we are judging
+ * is the one we had to make anyway; it only gives up the early exit, which was never the point. Breaking
+ * the loop is.
+ */
+function guardRead(docId: string, key: string, result: ToolResult | null): ToolResult | null {
   const now = Date.now();
-  const times = (_readGuard.get(docId) || []).filter((t) => now - t < READ_GUARD_WINDOW_MS);
+  const hash = resultHash(result);
+  const perDoc = _readGuard.get(docId) ?? new Map<string, { hash: string; times: number[] }>();
+  const prior = perDoc.get(key);
+  // A changed answer is a fresh start: the run of identical reads is broken, whoever broke it.
+  const times = prior && prior.hash === hash
+    ? prior.times.filter((t) => now - t < READ_GUARD_WINDOW_MS)
+    : [];
   if (times.length >= READ_GUARD_CAP) {
-    _readGuard.set(docId, times); // don't count the refused read
-    return `You have already read this document ${times.length} times in the last minute with no edits in ` +
-      `between, and its content has not changed. You already have it, do NOT read it again: make your edit ` +
-      `now (e.g. findAndReplaceInDoc or insertText), or say what is blocking you.`;
+    perDoc.set(key, { hash, times }); // don't count the refused read
+    _readGuard.set(docId, perDoc);
+    return { content: [{ type: 'text', text:
+      `You have already made this exact request ${times.length} times in the last minute with no edits in ` +
+      `between, and the answer came back identical every time. You already have it, do NOT ask again: make ` +
+      `your edit now (e.g. findAndReplaceInDoc or insertText), or say what is blocking you.` }], isError: false };
   }
   times.push(now);
-  _readGuard.set(docId, times);
-  return null;
+  perDoc.set(key, { hash, times });
+  _readGuard.set(docId, perDoc);
+  return result;
 }
 
 function invalidateReadGuard(docId: string): void {
@@ -2387,19 +2431,22 @@ export const toolDefinitions: ToolDefinition[] = [
 // Handler
 // ---------------------------------------------------------------------------
 
+/**
+ * Loop-breaker: cap repeated identical content-reads of one doc, and reset on any other op (a write, format
+ * or comment on the doc means the next read is legitimately fresh). Applied centrally, so it covers every
+ * read path in this module without any of them knowing about it.
+ */
 export async function handleTool(toolName: string, args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult | null> {
-  // Loop-breaker: cap repeated identical content-reads of one doc; reset the counter on any other op (a
-  // write/format/comment on the doc means the next read is legitimately fresh). Applied centrally so it
-  // covers every read path in this module.
-  const _docId = typeof args.documentId === 'string' ? (args.documentId as string) : undefined;
-  if (_docId) {
-    if (READ_GUARD_TOOLS.has(toolName)) {
-      const nudge = guardRead(_docId);
-      if (nudge) return { content: [{ type: 'text', text: nudge }], isError: false };
-    } else {
-      invalidateReadGuard(_docId);
-    }
+  const docId = typeof args.documentId === 'string' ? (args.documentId as string) : undefined;
+  if (!docId) return handleToolInner(toolName, args, ctx);
+  if (!READ_GUARD_TOOLS.has(toolName)) {
+    invalidateReadGuard(docId);
+    return handleToolInner(toolName, args, ctx);
   }
+  return guardRead(docId, readKey(toolName, args), await handleToolInner(toolName, args, ctx));
+}
+
+async function handleToolInner(toolName: string, args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult | null> {
   switch (toolName) {
 
     // =========================================================================
