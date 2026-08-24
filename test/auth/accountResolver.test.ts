@@ -307,7 +307,7 @@ test('resolver: ambiguous write refuses instead of picking one', async () => {
   );
 });
 
-test('resolver: no accounts at all throws', async () => {
+test('resolver: no accounts at all is no_accounts, naming the token store', async () => {
   const { resolver } = await buildResolver([]);
   await assert.rejects(
     () =>
@@ -315,7 +315,16 @@ test('resolver: no accounts at all throws', async () => {
         sessionId: STDIO_SESSION_ID,
         acceptableScopes: [SCOPE_DRIVE],
       }),
-    /\[no_credentials\] No Google account is authenticated on this server\./,
+    (err: Error) => {
+      // `no_accounts`, not `no_credentials`. The server has an OAuth client and
+      // can talk to Google; what it lacks is an account to act as, and the two
+      // want opposite responses from whoever is reading.
+      assert.match(err.message, /\[no_accounts\] No Google account is authorized on this server/);
+      // Rule 7: name what is missing, do not prescribe the recovery.
+      assert.match(err.message, /token store: /);
+      assert.doesNotMatch(err.message, /manage_accounts|\brun\b/);
+      return true;
+    },
   );
 });
 

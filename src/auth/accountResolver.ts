@@ -102,7 +102,13 @@ export class AccountResolver {
     // 4. Eligibility filter
     const all = this.store.list();
     if (all.length === 0) {
-      throw new ToolFailure('no_credentials', 'No Google account is authenticated on this server.');
+      // `no_accounts`, not `no_credentials`: the server can talk to Google, but
+      // nobody has authorized an account for it to act as. Those want opposite
+      // responses, and only the caller can act on the difference.
+      throw new ToolFailure(
+        'no_accounts',
+        `No Google account is authorized on this server (token store: ${this.store.getFilePath()}).`,
+      );
     }
     const eligible = all.filter(hasScopes);
     if (eligible.length === 0) {

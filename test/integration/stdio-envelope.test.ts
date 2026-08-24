@@ -20,7 +20,7 @@
 import assert from 'node:assert/strict';
 import { describe, it, before, after } from 'node:test';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
-import { mkdtempSync, rmSync, existsSync } from 'node:fs';
+import { mkdtempSync, rmSync, existsSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -36,8 +36,11 @@ class StdioServer {
   private pending = new Map<number, (msg: any) => void>();
   private nextId = 0;
 
-  constructor(serverPath: string, env: Record<string, string>) {
+  constructor(serverPath: string, env: Record<string, string>, unset: string[] = []) {
     const childEnv: Record<string, string | undefined> = { ...process.env, ...env };
+    // The auth mode is chosen by env-var PRESENCE, so a var inherited from the
+    // outer shell would silently pick a different mode than the one under test.
+    for (const key of unset) delete childEnv[key];
     // `if (!process.env.MCP_TESTING) main()` guards the CLI so the module can be
     // IMPORTED by a test. We are SPAWNING it, so the guard must not be inherited
     // or the child boots into a process that never starts a transport and every
@@ -174,5 +177,94 @@ describe('the envelope over the real stdio transport, with no credentials', () =
     }
 
     assert.deepEqual(offenders, [], `${offenders.length} of ${toolNames.length} tools broke the contract`);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Configured, but nobody has signed in.
+//
+// This state used to HANG. `buildAuthSystem()` with an empty store starts an
+// OAuth server, opens a browser and then polls once a second, forever, waiting
+// for a consent nobody can see when the server is a bundled stdio child. The
+// tool call never returned at all. There is no timeout under an MCP client's
+// dispatch loop, so it took the whole turn with it and said nothing.
+//
+// A hang cannot be caught by asserting on a reply, because there is no reply to
+// assert on. So the TIMEOUT is the assertion here: the rpc helper rejects, and
+// the rejection is what fails the test.
+// ---------------------------------------------------------------------------
+
+/** Generous enough to never flake, far below the forever this used to take. */
+const MUST_ANSWER_WITHIN_MS = 10_000;
+
+describe('the envelope with valid client keys and zero authorized accounts', () => {
+  let server: StdioServer;
+  let dir: string;
+
+  before(async () => {
+    const serverPath = join(process.cwd(), 'dist', 'index.js');
+    assert.ok(existsSync(serverPath), `built server missing at ${serverPath}`);
+
+    dir = mkdtempSync(join(tmpdir(), 'gdrive-zero-accounts-'));
+    // A well-formed OAuth client: the server CAN talk to Google. The secret is
+    // obviously fake and never leaves this directory.
+    writeFileSync(join(dir, 'keys.json'), JSON.stringify({
+      installed: {
+        client_id: '1234.apps.googleusercontent.com',
+        client_secret: 'not-a-real-secret',
+        redirect_uris: ['http://127.0.0.1:3000/oauth2callback'],
+      },
+    }));
+    // A valid, EMPTY v2 token store: no account has been authorized.
+    writeFileSync(join(dir, 'tokens.json'), JSON.stringify({ version: 2, accounts: {} }));
+
+    server = new StdioServer(serverPath, {
+      GOOGLE_DRIVE_OAUTH_CREDENTIALS: join(dir, 'keys.json'),
+      GOOGLE_DRIVE_MCP_TOKEN_PATH: join(dir, 'tokens.json'),
+    }, ['GOOGLE_APPLICATION_CREDENTIALS', 'GOOGLE_DRIVE_MCP_ACCESS_TOKEN']);
+    await server.start();
+  });
+
+  after(() => {
+    server?.stop();
+    if (dir) rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('answers within the budget instead of opening a browser and polling forever', async () => {
+    const started = Date.now();
+    const msg = await server.rpc('tools/call', { name: 'search', arguments: { query: 'x' } },
+      MUST_ANSWER_WITHIN_MS).catch((err: Error) => {
+      assert.fail(
+        `the call never came back (${err.message}). This is the hang: with an empty ` +
+        `store the server used to open a browser and poll for consent forever, and an ` +
+        `MCP dispatch loop has no timeout under it.`,
+      );
+    });
+    const elapsed = Date.now() - started;
+
+    assert.ok(elapsed < MUST_ANSWER_WITHIN_MS, `took ${elapsed}ms`);
+    assert.equal(msg.error, undefined, `a JSON-RPC error is not a tool result: ${JSON.stringify(msg.error)}`);
+    assert.equal(msg.result?.isError, true);
+
+    const text: string = msg.result.content[0].text;
+    // `no_accounts`, not `no_credentials`: the server has an OAuth client, it has
+    // no account to act as. Those want opposite responses from the caller.
+    assert.ok(text.startsWith('[no_accounts] '), `unexpected code: ${text.slice(0, 60)}`);
+    // Rule 7 asks it to name what is missing, not what to do about it.
+    assert.match(text, /tokens\.json/);
+    assert.doesNotMatch(text, /\nHTTP \d/);
+    assert.doesNotMatch(text, /\brun\b|reconnect|try again/i);
+  });
+
+  it('still answers the account tools, which are how you diagnose this state', async () => {
+    const listed = await server.rpc('tools/call',
+      { name: 'manage_accounts', arguments: { action: 'list' } }, MUST_ANSWER_WITHIN_MS);
+    assert.equal(listed.error, undefined);
+    assert.notEqual(listed.result?.isError, true, 'manage_accounts must work with zero accounts');
+
+    const status = await server.rpc('tools/call',
+      { name: 'authGetStatus', arguments: {} }, MUST_ANSWER_WITHIN_MS);
+    assert.equal(status.error, undefined);
+    assert.notEqual(status.result?.isError, true, 'authGetStatus must work with zero accounts');
   });
 });

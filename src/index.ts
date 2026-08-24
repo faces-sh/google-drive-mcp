@@ -115,10 +115,27 @@ async function ensureAuthSystem(): Promise<AuthSystem> {
   }
 
   log('Initializing authentication');
-  authSystemPromise = buildAuthSystem();
+  // NEVER interactive on the server path. `buildAuthSystem()` with an empty store
+  // otherwise starts an OAuth server, opens a browser, and then POLLS FOREVER
+  // waiting for a consent that, over stdio, nobody can see: the tool call never
+  // returns at all. There is no timeout under an MCP client's dispatch loop, so
+  // that hangs the whole turn with nothing in the transcript to say why -- worse
+  // than any wrong envelope, because it is both invisible and unbounded.
+  //
+  // A person who WANTS the browser runs the `auth` command, which is unchanged
+  // and still interactive (see runAuthServer).
+  authSystemPromise = buildAuthSystem({ interactiveIfEmpty: false });
   try {
     authSystem = await authSystemPromise;
     log('Authentication complete');
+    if (authSystem.mode === 'local-oauth' && authSystem.store.list().length === 0) {
+      // Guidance goes to the log, where an operator running this server by hand
+      // sees it; the tool result states the fact and stops (rule 7).
+      console.error(
+        `No Google account is authorized yet (token store: ${authSystem.store.getFilePath()}). ` +
+          `Run this package's \`auth\` command to authorize one.`,
+      );
+    }
     return authSystem;
   } catch (err) {
     // Whatever went wrong building the auth system, the caller could not be
@@ -530,7 +547,10 @@ async function buildToolContext(
   const account = scopedAccount ?? defaultAccountOrUndefined();
 
   const noAccount = (): never => {
-    throw new ToolFailure('no_credentials', 'No Google account is authenticated on this server.');
+    throw new ToolFailure(
+      'no_accounts',
+      `No Google account is authorized on this server (token store: ${sys.store.getFilePath()}).`,
+    );
   };
 
   // Eagerly build the account-scoped clients for the back-compat fields. On the
