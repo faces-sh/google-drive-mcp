@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { buildCalendarEventUpdate } from '../utils.js';
-import { errorResponse } from '../types.js';
+import { errorResponse } from '../errors.js';
 import type { ToolDefinition, ToolResult, ToolContext } from '../types.js';
 
 // ---------------------------------------------------------------------------

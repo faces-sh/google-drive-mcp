@@ -2,6 +2,8 @@
 // Pure utility functions extracted from index.ts for testability
 // -----------------------------------------------------------------------------
 
+import { ToolFailure } from './errors.js';
+
 // ---------------------------------------------------------------------------
 // Drive list params
 // ---------------------------------------------------------------------------
@@ -166,7 +168,9 @@ export function convertA1ToGridRange(a1Notation: string, sheetId: number): GridR
   const match = a1Notation.match(rangeRegex);
 
   if (!match) {
-    throw new Error(`Invalid A1 notation: ${a1Notation}`);
+    // A malformed range never reaches Google, so there is no status line to
+    // carry: it is the caller's argument that is wrong.
+    throw new ToolFailure('bad_request', `Invalid A1 notation: ${a1Notation}`);
   }
 
   const [, startCol, startRow, , endCol, endRow] = match;

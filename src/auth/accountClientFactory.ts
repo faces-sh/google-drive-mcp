@@ -16,6 +16,7 @@ import { AccountStore } from './accountStore.js';
 import { loadCredentials } from './client.js';
 import { AccountRecord } from './types.js';
 import { describeErrorForLog } from './utils.js';
+import { ToolFailure, httpDetailsOf, toolFailure } from '../errors.js';
 
 /** Buffer before access-token expiry that triggers a refresh (ms). */
 const REFRESH_BUFFER_MS = 5 * 60 * 1000;
@@ -44,7 +45,9 @@ export class AccountClientFactory {
    */
   async getClient(alias: string): Promise<OAuth2Client> {
     const record = this.store.get(alias);
-    if (!record) throw new Error(`No account registered with alias "${alias}".`);
+    if (!record) {
+      throw new ToolFailure('no_credentials', `Unknown account: "${alias}".`);
+    }
 
     const synthetic = this.store.getSyntheticClient(alias);
     if (synthetic) return synthetic as OAuth2Client;
@@ -128,21 +131,36 @@ export class AccountClientFactory {
         // The `'tokens'` listener handles persistence. `refreshAccessToken`
         // already calls `setCredentials` internally.
         if (!credentials.access_token) {
-          throw new Error('Token refresh returned no access_token.');
+          throw new ToolFailure(
+            'unexpected_response',
+            `Google accepted the token refresh for "${alias}" but returned no access token.`,
+          );
         }
       } catch (err) {
+        if (err instanceof ToolFailure) throw err;
         if (isInvalidGrant(err)) {
-          // Refresh token revoked or expired. Surface an actionable error instead
-          // of an opaque downstream 401 so the user knows how to recover.
-          throw new Error(
-            `Account '${alias}' authorization was revoked or has expired. ` +
-              `Run:  manage_accounts add ${alias}  to reconnect it.`,
+          // Refresh token revoked or expired. Google's own body says WHICH
+          // ("Token has been expired or revoked", "invalid_grant"), and that is
+          // the one thing that separates a credential to reconnect from a
+          // permission the account never had. Carry it through verbatim instead
+          // of collapsing it to a sentence.
+          throw toolFailure(
+            `The stored authorization for account '${alias}' was revoked or has expired.`,
+            err,
+            'no_credentials',
           );
         }
         // Never log the raw error: gaxios embeds the refresh POST body (refresh
         // token + client secret) in err.config.
         console.error(`Token refresh failed for "${alias}": ${describeErrorForLog(err)}`);
-        // Transient failure — don't throw; let the caller's API call surface it.
+        // A 4xx from Google's token endpoint is a decision about this account, not
+        // a hiccup, and the next API call would report it as an opaque 401 with
+        // none of the detail. Surface it here, with the status and the body.
+        const http = httpDetailsOf(err);
+        if (http && http.status >= 400 && http.status < 500) {
+          throw toolFailure(`Could not refresh the access token for account '${alias}'.`, err);
+        }
+        // Transient (5xx, network): don't throw; let the caller's API call surface it.
       }
     })().finally(() => {
       this.inflightRefresh.delete(alias);

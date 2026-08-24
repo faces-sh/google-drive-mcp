@@ -8,7 +8,7 @@ import { basename, extname, join } from 'path';
 import pdfLib from 'pdf-lib';
 const { PDFDocument } = pdfLib;
 import type { ToolDefinition, ToolContext, ToolResult } from '../types.js';
-import { errorResponse } from '../types.js';
+import { errorResponse, failure, notFound, unexpectedResponse } from '../errors.js';
 import { escapeDriveQuery, getMimeTypeFromFilename, isTextMime, TEXT_MIME_TYPES, ALL_DRIVES_LIST_PARAMS, PARENT_SCOPED_LIST_PARAMS } from '../utils.js';
 import { downloadTextContent } from './text-content.js';
 import { downloadDriveFile, GOOGLE_WORKSPACE_EXPORT_FORMATS } from '../download-file.js';
@@ -871,8 +871,8 @@ export async function handleTool(
       const existingFileId = await ctx.checkFileExists(data.name, parentFolderId);
       if (existingFileId) {
         return errorResponse(
-          `A file named "${data.name}" already exists in this location. ` +
-          `To update it, use updateTextFile with fileId: ${existingFileId}`
+          `A file named "${data.name}" already exists in this location (id ${existingFileId}).`,
+          'already_exists',
         );
       }
 
@@ -917,7 +917,7 @@ export async function handleTool(
 
       const currentMimeType = existingFile.data.mimeType || 'text/plain';
       if (!isTextMime(currentMimeType)) {
-        return errorResponse("File is not a text file (expected a text/* MIME type).");
+        return errorResponse('That file is not a text file (a text/* MIME type was expected).', 'unsupported');
       }
 
       const updateMetadata: { name?: string; mimeType?: string } = {};
@@ -965,8 +965,8 @@ export async function handleTool(
 
       if (!isTextMime(mimeType)) {
         return errorResponse(
-          `File "${fileName}" has MIME type "${mimeType}", which is not a text/* type. ` +
-          `For Google Docs, use readGoogleDoc instead.`
+          `File "${fileName}" has MIME type "${mimeType}", which is not a text/* type.`,
+          'unsupported',
         );
       }
 
@@ -1005,8 +1005,8 @@ export async function handleTool(
       const existingFolderId = await ctx.checkFileExists(data.name, parentFolderId);
       if (existingFolderId) {
         return errorResponse(
-          `A folder named "${data.name}" already exists in this location. ` +
-          `Folder ID: ${existingFolderId}`
+          `A folder named "${data.name}" already exists in this location (id ${existingFolderId}).`,
+          'already_exists',
         );
       }
       const folderMetadata = {
@@ -1393,7 +1393,7 @@ export async function handleTool(
       if (data.localPath) {
         // Validate local file exists
         if (!existsSync(data.localPath)) {
-          return errorResponse(`File not found: ${data.localPath}`);
+          return notFound(`File not found: ${data.localPath}`);
         }
         contentSize = statSync(data.localPath).size;
       } else {
@@ -1425,8 +1425,9 @@ export async function handleTool(
         const existingMime = existing.data.mimeType || '';
         if (existingMime.startsWith('application/vnd.google-apps')) {
           return errorResponse(
-            `File ${data.fileId} is a Google Workspace file (${existingMime}). ` +
-            `Specify mimeType (e.g. the Office format of the uploaded content) so Drive can convert it.`
+            `File ${data.fileId} is a Google Workspace file (${existingMime}), so the upload needs an ` +
+              `explicit mimeType for Drive to convert it.`,
+            'bad_request',
           );
         }
         detectedMime = existingMime;
@@ -1449,8 +1450,9 @@ export async function handleTool(
 
       if (data.convertToGoogleFormat && !targetMimeType) {
         return errorResponse(
-          `Cannot convert MIME type "${detectedMime}" to a Google Workspace format. ` +
-          `Supported: .docx, .doc, .xlsx, .xls, .pptx, .ppt`
+          `Cannot convert MIME type "${detectedMime}" to a Google Workspace format ` +
+            `(supported: .docx, .doc, .xlsx, .xls, .pptx, .ppt).`,
+          'unsupported',
         );
       }
 
@@ -1624,13 +1626,13 @@ export async function handleTool(
           (p) => p.type === 'user' && (p.emailAddress || '').toLowerCase() === data.emailAddress!.toLowerCase(),
         );
         if (!found?.id) {
-          return errorResponse(`No permission found for ${data.emailAddress}`);
+          return notFound(`No permission on that file belongs to ${data.emailAddress}.`);
         }
         permissionId = found.id;
       }
 
       if (!permissionId) {
-        return errorResponse("Could not resolve a permission ID to remove");
+        return errorResponse('Neither a permissionId nor an emailAddress was given, so there is no permission to remove.');
       }
 
       await ctx.getDrive().permissions.delete({
@@ -1711,7 +1713,7 @@ export async function handleTool(
       });
 
       if (source.data.mimeType !== 'application/pdf') {
-        return errorResponse(`File ${data.fileId} is not a PDF (mimeType=${source.data.mimeType || 'unknown'})`);
+        return errorResponse(`File ${data.fileId} is not a PDF (mimeType=${source.data.mimeType || 'unknown'}).`, 'unsupported');
       }
 
       const parentId = data.parentFolderId || source.data.parents?.[0];
@@ -1745,7 +1747,10 @@ export async function handleTool(
       });
 
       const files = list.data.files || [];
-      const results: Array<{ id?: string; name?: string; docId?: string; ok: boolean; error?: string }> = [];
+      const results: Array<{ id?: string; name?: string; docId?: string; ok: boolean }> = [];
+      // The FIRST failure, kept whole. Every later one is counted, not summarised:
+      // one verbatim body is evidence, ten concatenated ones are noise.
+      let firstFailure: { name: string; err: unknown } | undefined;
 
       // Sequential processing is intentional — parallel copies trigger Google API rate limits.
       for (const f of files) {
@@ -1762,16 +1767,29 @@ export async function handleTool(
           });
           results.push({ id: f.id ?? undefined, name: f.name ?? undefined, docId: converted.data.id ?? undefined, ok: true });
         } catch (err: any) {
-          const message = err?.message || 'Unknown conversion error';
-          results.push({ id: f.id ?? undefined, name: f.name ?? undefined, ok: false, error: message });
+          results.push({ id: f.id ?? undefined, name: f.name ?? undefined, ok: false });
+          if (!firstFailure) firstFailure = { name: f.name || f.id || 'a file', err };
           if (!data.continueOnError) break;
         }
       }
 
       const ok = results.filter(r => r.ok).length;
       const fail = results.length - ok;
+      const lines = results.map(r => r.ok ? `✅ ${r.name} -> ${r.docId}` : `❌ ${r.name}`).join('\n');
+
+      // Rule 6. This used to answer `isError: false` when every single conversion
+      // had failed, so "Failed=12" arrived as a successful call and the caller had
+      // to read the prose to find out otherwise.
+      if (firstFailure) {
+        return failure(
+          `Converted ${ok} of ${results.length} PDFs in that folder; ${fail} could not be converted, ` +
+            `starting with "${firstFailure.name}".`,
+          firstFailure.err,
+        );
+      }
+
       return {
-        content: [{ type: 'text', text: `Bulk PDF conversion finished. Processed=${results.length}, Success=${ok}, Failed=${fail}\n\n${results.map(r => r.ok ? `✅ ${r.name} -> ${r.docId}` : `❌ ${r.name}: ${r.error}`).join('\n')}` }],
+        content: [{ type: 'text', text: `Bulk PDF conversion finished. Processed=${results.length}, Success=${ok}, Failed=${fail}\n\n${lines}` }],
         isError: false,
       };
     }
@@ -1781,7 +1799,7 @@ export async function handleTool(
       if (!validation.success) return errorResponse(validation.error.errors[0].message);
       const data = validation.data;
 
-      if (!existsSync(data.localPath)) return errorResponse(`File not found: ${data.localPath}`);
+      if (!existsSync(data.localPath)) return notFound(`File not found: ${data.localPath}`);
       const parentId = await ctx.resolveFolderId(data.parentFolderId);
 
       if (!data.split) {
@@ -1812,14 +1830,24 @@ export async function handleTool(
           const partPath = splitResult.files[i];
           const partName = `${baseName}-part-${i + 1}.pdf`;
 
-          const uploaded = await ctx.getDrive().files.create({
-            requestBody: { name: partName, parents: [parentId] },
-            media: { mimeType: 'application/pdf', body: createReadStream(partPath) },
-            fields: 'id,name,webViewLink',
-            supportsAllDrives: true,
-          });
-
-          uploadedParts.push({ id: uploaded.data.id, name: uploaded.data.name });
+          try {
+            const uploaded = await ctx.getDrive().files.create({
+              requestBody: { name: partName, parents: [parentId] },
+              media: { mimeType: 'application/pdf', body: createReadStream(partPath) },
+              fields: 'id,name,webViewLink',
+              supportsAllDrives: true,
+            });
+            uploadedParts.push({ id: uploaded.data.id, name: uploaded.data.name });
+          } catch (err) {
+            // Parts 1..i-1 are already in the user's Drive. Letting this throw bare
+            // reported the failure but not the orphans, so nobody could clean up.
+            return failure(
+              `Uploaded ${uploadedParts.length} of ${splitResult.files.length} parts to Drive, then ` +
+                `"${partName}" could not be uploaded; the earlier parts are still there ` +
+                `(${uploadedParts.map((up) => `${up.name} id ${up.id}`).join(', ') || 'none'}).`,
+              err,
+            );
+          }
         }
 
         const lines = uploadedParts.map((p, idx) => `- part ${idx + 1}: ${p.name} (ID: ${p.id})`);
@@ -1916,7 +1944,7 @@ export async function handleTool(
             || Object.keys(exportLinks)[0];
 
           if (!selectedMime || !exportLinks[selectedMime]) {
-            return errorResponse('Selected revision has no usable export links for restore.');
+            return unexpectedResponse('That revision has no usable export links, so its content cannot be read back.');
           }
 
           uploadMimeType = selectedMime;
@@ -1956,7 +1984,7 @@ export async function handleTool(
           isError: false,
         };
       } catch (err: unknown) {
-        return errorResponse(`Failed to restore revision: ${err instanceof Error ? err.message : String(err)}`);
+        return failure(`Could not restore file ${data.fileId} from revision ${data.revisionId}.`, err);
       }
     }
 
@@ -1967,7 +1995,10 @@ export async function handleTool(
       try {
         scopeStatus = resolveScopeStatus(ctx);
       } catch (e: unknown) {
-        return errorResponse(`Invalid scope configuration: ${e instanceof Error ? e.message : String(e)}`);
+        return errorResponse(
+          `Invalid scope configuration: ${e instanceof Error ? e.message : String(e)}`,
+          'invalid_configuration',
+        );
       }
       const { requestedScopes, grantedScopes, missingScopes } = scopeStatus;
       const expiryDate = ctx.authClient?.credentials?.expiry_date as number | undefined;
@@ -2062,7 +2093,10 @@ export async function handleTool(
       try {
         scopeStatus = resolveScopeStatus(ctx);
       } catch (e: unknown) {
-        return errorResponse(`Invalid scope configuration: ${e instanceof Error ? e.message : String(e)}`);
+        return errorResponse(
+          `Invalid scope configuration: ${e instanceof Error ? e.message : String(e)}`,
+          'invalid_configuration',
+        );
       }
       const { requestedScopes, grantedScopes, missingScopes } = scopeStatus;
       const presetsResolved = Object.fromEntries(
@@ -2108,11 +2142,7 @@ export async function handleTool(
           isError: false,
         };
       } catch (e: unknown) {
-        const message = e instanceof Error ? e.message : String(e);
-        return {
-          content: [{ type: 'text', text: `Auth access check failed:\n${JSON.stringify({ message }, null, 2)}` }],
-          isError: true,
-        };
+        return failure('Could not check what this account has access to.', e);
       }
     }
 
@@ -2184,7 +2214,7 @@ export async function handleTool(
           }
         }
       } catch (e: unknown) {
-        return errorResponse(e instanceof Error ? e.message : String(e));
+        return failure('Could not complete that account-management action.', e);
       }
       return null;
     }

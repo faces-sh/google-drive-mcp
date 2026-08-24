@@ -251,8 +251,8 @@ describe('Docs tools', () => {
       }));
       const res = await callTool(ctx.client, 'updateGoogleDoc', { documentId: 'doc-1', content: 'x', tabId: 'missing' });
       assert.equal(res.isError, true);
+      assert.ok(res.content[0].text!.startsWith('[not_found] '));
       assert.ok(res.content[0].text!.includes('Tab with ID "missing" not found'));
-      assert.ok(res.content[0].text!.includes('listDocumentTabs'));
 
       const calls = ctx.mocks.docs.tracker.getCalls('documents.batchUpdate');
       assert.equal(calls.length, 0);
@@ -3061,7 +3061,9 @@ describe('Docs tools', () => {
 
       assert.equal(res.isError, true);
       assert.ok(res.content[0].text!.includes('fn-orphan'));
-      assert.ok(res.content[0].text!.includes('failed to insert content'));
+      // The footnote reference exists and is empty: a failure, in the envelope.
+      assert.ok(res.content[0].text!.startsWith('[internal_error] '));
+      assert.ok(res.content[0].text!.includes('could not put any content in it'));
       assert.ok(res.content[0].text!.includes('Simulated Docs API failure'));
 
       const calls = ctx.mocks.docs.tracker.getCalls('documents.batchUpdate');
@@ -3174,8 +3176,8 @@ describe('Docs tools', () => {
         const before = ctx.mocks.docs.tracker.getCalls('documents.batchUpdate').length;
         const res = await callTool(ctx.client, 'applyTextStyle', { documentId: 'doc-1', textToFind: 'x', bold: true, tabId: 'missing' });
         assert.equal(res.isError, true);
+        assert.ok(res.content[0].text!.startsWith('[not_found] '));
         assert.ok(res.content[0].text!.includes('Tab with ID "missing" not found'));
-        assert.ok(res.content[0].text!.includes('listDocumentTabs'));
         assert.equal(ctx.mocks.docs.tracker.getCalls('documents.batchUpdate').length, before);
         ctx.mocks.docs.service.documents.get._resetImpl();
       });
@@ -3275,8 +3277,8 @@ describe('Docs tools', () => {
         const before = ctx.mocks.docs.tracker.getCalls('documents.batchUpdate').length;
         const res = await callTool(ctx.client, 'applyParagraphStyle', { documentId: 'doc-1', textToFind: 'x', alignment: 'CENTER', tabId: 'missing' });
         assert.equal(res.isError, true);
+        assert.ok(res.content[0].text!.startsWith('[not_found] '));
         assert.ok(res.content[0].text!.includes('Tab with ID "missing" not found'));
-        assert.ok(res.content[0].text!.includes('listDocumentTabs'));
         assert.equal(ctx.mocks.docs.tracker.getCalls('documents.batchUpdate').length, before);
         ctx.mocks.docs.service.documents.get._resetImpl();
       });

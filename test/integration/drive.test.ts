@@ -274,7 +274,8 @@ describe('Drive tools', () => {
       stubTextFile('irrelevant', 'application/vnd.google-apps.document', 'My Doc');
       const res = await callTool(ctx.client, 'readTextFile', { fileId: 'file-1' });
       assert.equal(res.isError, true);
-      assert.ok(res.content[0].text!.includes('readGoogleDoc'));
+      assert.ok(res.content[0].text!.startsWith('[unsupported] '));
+      assert.ok(res.content[0].text!.includes('not a text/* type'));
     });
 
     it('validation error on missing fileId', async () => {

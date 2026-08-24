@@ -73,6 +73,5 @@ export interface AccountOps {
   setDefault(alias: string | null): Promise<void>;
 }
 
-export function errorResponse(message: string): ToolResult {
-  return { content: [{ type: "text", text: `Error: ${message}` }], isError: true };
-}
+// Failure results are built in ./errors.ts, which owns the uniform envelope
+// (`[code] sentence` / `HTTP <status> <reason>` / the provider's body verbatim).

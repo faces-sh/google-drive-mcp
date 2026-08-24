@@ -42,7 +42,16 @@ import {
   PARENT_SCOPED_LIST_PARAMS,
 } from './utils.js';
 import type { AccountOps, AddAccountResult, ToolContext, ToolResult } from './types.js';
-import { errorResponse } from './types.js';
+import {
+  envelopeText,
+  errorResponse,
+  failure,
+  humanizeToolName,
+  noCredentials,
+  notFound,
+  toolFailure,
+  ToolFailure,
+} from './errors.js';
 import { loadRuntimeConfig, parseBoolEnv, type RuntimeConfig } from './utils/cliArgs.js';
 import { GOOGLE_CALLBACK_PATH, isLoopbackHost, loadTeamConfig } from './auth/team/config.js';
 import { createTeamRuntime, type TeamRuntime } from './auth/team/runtime.js';
@@ -106,18 +115,46 @@ async function ensureAuthSystem(): Promise<AuthSystem> {
   }
 
   log('Initializing authentication');
-  authSystemPromise = buildAuthSystem();
+  // NEVER interactive on the server path. `buildAuthSystem()` with an empty store
+  // otherwise starts an OAuth server, opens a browser, and then POLLS FOREVER
+  // waiting for a consent that, over stdio, nobody can see: the tool call never
+  // returns at all. There is no timeout under an MCP client's dispatch loop, so
+  // that hangs the whole turn with nothing in the transcript to say why -- worse
+  // than any wrong envelope, because it is both invisible and unbounded.
+  //
+  // A person who WANTS the browser runs the `auth` command, which is unchanged
+  // and still interactive (see runAuthServer).
+  authSystemPromise = buildAuthSystem({ interactiveIfEmpty: false });
   try {
     authSystem = await authSystemPromise;
     log('Authentication complete');
+    if (authSystem.mode === 'local-oauth' && authSystem.store.list().length === 0) {
+      // Guidance goes to the log, where an operator running this server by hand
+      // sees it; the tool result states the fact and stops (rule 7).
+      console.error(
+        `No Google account is authorized yet (token store: ${authSystem.store.getFilePath()}). ` +
+          `Run this package's \`auth\` command to authorize one.`,
+      );
+    }
     return authSystem;
+  } catch (err) {
+    // Whatever went wrong building the auth system, the caller could not be
+    // authenticated. Anything unclassified here (a raw fs ENOENT on a key file,
+    // a GoogleAuth internal) becomes `no_credentials` rather than escaping as a
+    // protocol error the model never sees.
+    log('Authentication failed', { error: describeErrorForLog(err) });
+    if (err instanceof ToolFailure) throw err;
+    throw new ToolFailure(
+      'no_credentials',
+      `Could not authenticate this server against Google: ${describeErrorForLog(err)}`,
+    );
   } finally {
     authSystemPromise = null;
   }
 }
 
 function requireAuthSystem(): AuthSystem {
-  if (!authSystem) throw new Error('Authentication required');
+  if (!authSystem) throw new ToolFailure('no_credentials', 'The server has no authenticated Google account yet.');
   return authSystem;
 }
 
@@ -304,7 +341,7 @@ async function removeAccountFlow(alias: string): Promise<void> {
   requireLocalOAuthMode('remove');
   const sys = requireAuthSystem();
   if (!sys.store.get(alias)) {
-    throw new Error(`No account with alias "${alias}".`);
+    throw new ToolFailure('not_found', `Unknown account: "${alias}".`);
   }
   await sys.store.remove(alias);
   sys.factory.evict(alias);
@@ -371,7 +408,12 @@ async function resolvePath(pathStr: string, drive: drive_v3.Drive): Promise<stri
       });
 
       if (!folder.data.id) {
-        throw new Error(`Failed to create intermediate folder: ${part}`);
+        // Drive answered 2xx without an id, so nothing downstream can address the
+        // folder. Not a success (rule 6), and not an HTTP failure (rule 4).
+        throw new ToolFailure(
+          'unexpected_response',
+          `Could not create the folder "${part}": Google Drive returned no file id for it.`,
+        );
       }
 
       currentFolderId = folder.data.id;
@@ -396,7 +438,7 @@ async function resolveFolderId(input: string | undefined, drive: drive_v3.Drive)
 function validateTextFileExtension(name: string) {
   const ext = getExtensionFromFilename(name);
   if (!['txt', 'md'].includes(ext)) {
-    throw new Error("File name must end with .txt or .md for text files.");
+    throw new ToolFailure('bad_request', 'The file name must end with .txt or .md for a text file.');
   }
 }
 
@@ -420,8 +462,11 @@ async function checkFileExists(name: string, parentFolderId: string = 'root', dr
     }
     return null;
   } catch (error) {
-    log('Error checking file existence:', error);
-    return null;
+    // Rule 6: a failed lookup is NOT "the file does not exist". Swallowing it
+    // here told createGoogleDoc the name was free, so a 403 on the folder became
+    // a duplicate document (or a second, more confusing failure downstream).
+    log('Error checking file existence:', describeErrorForLog(error));
+    throw toolFailure(`Could not check whether "${name}" already exists in that folder.`, error);
   }
 }
 
@@ -468,7 +513,8 @@ function normalizeAccountArg(raw: unknown): string | undefined {
     // An array/object silently coerced to the default would route to the wrong
     // account and return partial results. Fail loudly instead (fanout dispatch
     // is not yet supported — see the resolver's Phase-3 notes).
-    throw new Error(
+    throw new ToolFailure(
+      'bad_request',
       `The 'account' argument must be a single account alias (a string), but received ` +
         `${Array.isArray(raw) ? 'an array' : `a ${typeof raw}`}. Targeting multiple ` +
         `accounts in one call is not supported — make one call per account.`,
@@ -501,8 +547,9 @@ async function buildToolContext(
   const account = scopedAccount ?? defaultAccountOrUndefined();
 
   const noAccount = (): never => {
-    throw new Error(
-      'No accounts are authenticated. Run "manage_accounts add <alias>" to add one.',
+    throw new ToolFailure(
+      'no_accounts',
+      `No Google account is authorized on this server (token store: ${sys.store.getFilePath()}).`,
     );
   };
 
@@ -591,18 +638,20 @@ async function handleTeamToolCall(
     if (typeof sub !== 'string' || sub.length === 0) {
       // requireBearerAuth guarantees an identity on every /mcp request;
       // defense-in-depth in case dispatch is ever reached another way.
-      return errorResponse('Unauthenticated request: no user identity is attached to this call.');
+      return noCredentials('Unauthenticated request: no user identity is attached to this call.');
     }
     if (toolName === 'manage_accounts') {
       return errorResponse(
         'manage_accounts is not available in team mode — each member signs in through the ' +
           "connector's OAuth flow and always acts as themselves.",
+        'unsupported',
       );
     }
     if (rawArgs.account !== undefined) {
       return errorResponse(
         "The 'account' parameter is not available in team mode — every call runs as the " +
           'signed-in user.',
+        'unsupported',
       );
     }
     if (TEAM_HIDDEN_TOOLS.has(toolName)) {
@@ -610,6 +659,7 @@ async function handleTeamToolCall(
         `${toolName} is not available in team mode — it reports the server's local ` +
           'single-user auth state, which does not apply to a team member signed in through ' +
           'the connector OAuth flow.',
+        'unsupported',
       );
     }
 
@@ -617,15 +667,13 @@ async function handleTeamToolCall(
       const meta = TOOL_META[toolName] ?? FALLBACK_META;
       const user = await runtime.store.getUser(sub);
       if (!user) {
-        return errorResponse(
-          'Your team sign-in is no longer on file on this server. Reconnect this connector to sign in again.',
-        );
+        return noCredentials('Your team sign-in is no longer on file on this server.');
       }
       if (!coversScopes(user.grantedScopes.join(' '), meta.acceptableScopes)) {
         return errorResponse(
-          `Your Google authorization lacks the required scope for this operation: ` +
-            `${meta.acceptableScopes.join(', ')}. Reconnect this connector and approve all ` +
-            'requested permissions.',
+          `Your Google authorization lacks the required scope for this operation ` +
+            `(requires one of: ${meta.acceptableScopes.join(', ')}).`,
+          'insufficient_scope',
         );
       }
       // Also enforce the bearer token's OWN scopes. A client may narrow its
@@ -637,8 +685,8 @@ async function handleTeamToolCall(
       if (!coversScopes(tokenScopes.join(' '), meta.acceptableScopes)) {
         return errorResponse(
           `This connection's access token is not authorized for this operation ` +
-            `(requires one of: ${meta.acceptableScopes.join(', ')}). Reconnect the connector ` +
-            'and request the needed scopes.',
+            `(requires one of: ${meta.acceptableScopes.join(', ')}).`,
+          'insufficient_scope',
         );
       }
     }
@@ -649,10 +697,10 @@ async function handleTeamToolCall(
       const result = await mod.handleTool(toolName, rawArgs, ctx);
       if (result !== null) return result;
     }
-    return errorResponse('Tool not found');
+    return notFound(`This server has no tool named "${toolName}".`);
   } catch (error) {
-    log('Error in team tool request handler', { error: (error as Error).message });
-    return errorResponse((error as Error).message);
+    log('Error in team tool request handler', { error: describeErrorForLog(error) });
+    return failure(`Could not ${humanizeToolName(toolName)}.`, error);
   }
 }
 
@@ -668,7 +716,7 @@ async function buildTeamToolContext(sessionId: string, sub: string): Promise<Too
   const authClient = await runtime.clientFactory.getClient(sub);
 
   const notInTeamMode = (what: string) => () => {
-    throw new Error(`${what} is not available in team mode.`);
+    throw new ToolFailure('unsupported', `${what} is not available in team mode.`);
   };
 
   return {
@@ -685,18 +733,19 @@ async function buildTeamToolContext(sessionId: string, sub: string): Promise<Too
 
     sessionId,
     resolveAccount: async () => {
-      throw new Error(
-        'Account selection is not available in team mode — every call runs as the signed-in user.',
+      throw new ToolFailure(
+        'unsupported',
+        'Account selection is not available in team mode: every call runs as the signed-in user.',
       );
     },
     getDriveFor: async () => {
-      throw new Error('getDriveFor is not available in team mode.');
+      throw new ToolFailure('unsupported', 'Targeting another account is not available in team mode.');
     },
     getCalendarFor: async () => {
-      throw new Error('getCalendarFor is not available in team mode.');
+      throw new ToolFailure('unsupported', 'Targeting another account is not available in team mode.');
     },
     getAuthClientFor: async () => {
-      throw new Error('getAuthClientFor is not available in team mode.');
+      throw new ToolFailure('unsupported', 'Targeting another account is not available in team mode.');
     },
     accountOps: {
       mode: 'external-token',
@@ -752,7 +801,32 @@ function createMcpServer(config: RuntimeConfig = runtimeConfig): Server {
     return { tools: definitions.map(withAccountParam) };
   });
 
+  // The outer try is the contract's boundary, and it has to be the OUTERMOST
+  // thing in this handler. Anything that throws past it leaves the SDK to answer
+  // with a JSON-RPC protocol error, which is not a tool result: it carries no
+  // `isError` flag, the model never sees its text, and Maestro's `declaresFailure`
+  // (a leading `[snake_case_code]`) can never match it. That is exactly what
+  // happened while `await ensureAuthSystem()` sat one line ABOVE the try: with a
+  // credential path that did not exist, all 116 tools answered
+  // `{"error":{"code":-32603,"message":"ENOENT ..."}}` and none of them reached
+  // the envelope below.
   s.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
+    const toolName = request.params.name;
+    try {
+      return await handleCallTool(request, extra);
+    } catch (error) {
+      log('Error escaping the tool request handler', { tool: toolName, error: describeErrorForLog(error) });
+      return failure(`Could not ${humanizeToolName(toolName)}.`, error);
+    }
+  });
+
+  return s;
+}
+
+async function handleCallTool(
+  request: { params: { name: string; arguments?: Record<string, unknown> } },
+  extra: { sessionId?: string; authInfo?: { extra?: Record<string, unknown>; scopes?: string[] } } | undefined,
+): Promise<ToolResult> {
     if (teamRuntime) {
       return handleTeamToolCall(request.params.name, request.params.arguments ?? {}, extra);
     }
@@ -792,7 +866,8 @@ function createMcpServer(config: RuntimeConfig = runtimeConfig): Server {
         });
         if (targeting.kind === 'fanout') {
           // Phase 2 ships single-account dispatch only. Read-fanout is Phase 3.
-          throw new Error(
+          throw new ToolFailure(
+            'bad_request',
             `Tool "${toolName}" resolved to multiple accounts (${targeting.accounts
               .map((a) => a.alias)
               .join(', ')}). Read-fanout is not yet supported. Specify 'account' explicitly ` +
@@ -809,14 +884,15 @@ function createMcpServer(config: RuntimeConfig = runtimeConfig): Server {
         // Park a large result + prepend its slug so the next tool can wire it instead of retyping.
         if (result !== null) return await wrapResult(result);
       }
-      return errorResponse('Tool not found');
+      return notFound(`This server has no tool named "${toolName}".`);
     } catch (error) {
-      log('Error in tool request handler', { error: (error as Error).message });
-      return errorResponse((error as Error).message);
+      // Every Google failure that no handler chose to catch lands here. It MUST
+      // keep the status line and Google's body: this is the one place that used
+      // to reduce a 403 to its one-line message, which is what made an expired
+      // credential and a permission the account never had indistinguishable.
+      log('Error in tool request handler', { error: describeErrorForLog(error) });
+      return failure(`Could not ${humanizeToolName(toolName)}.`, error);
     }
-  });
-
-  return s;
 }
 
 // Registers the optional MCP "resources" capability handlers (gdrive:/// file
@@ -824,6 +900,34 @@ function createMcpServer(config: RuntimeConfig = runtimeConfig): Server {
 // disabled via GOOGLE_DRIVE_MCP_DISABLE_RESOURCES / --no-resources.
 function registerResourceHandlers(s: Server): void {
   s.setRequestHandler(ListResourcesRequestSchema, async (request) => {
+    // A resources request answers over JSON-RPC, which has no `isError` flag, so
+    // the envelope travels as the error's message instead. Same three lines.
+    try {
+      return await listResources(request);
+    } catch (error) {
+      throw asEnvelopeError('Could not list the files in Drive.', error);
+    }
+  });
+
+  s.setRequestHandler(ReadResourceRequestSchema, async (request) => {
+    try {
+      return await readResource(request);
+    } catch (error) {
+      throw asEnvelopeError(`Could not read ${request.params.uri}.`, error);
+    }
+  });
+}
+
+/**
+ * Render any caught error as an envelope-carrying Error. Used on the resources
+ * capability, where the MCP result has no `isError` flag to set.
+ */
+function asEnvelopeError(sentence: string, error: unknown): Error {
+  const failed = toolFailure(sentence, error);
+  return new Error(envelopeText(failed.code, failed.sentence, failed.http));
+}
+
+async function listResources(request: { params?: { cursor?: string } }) {
     await ensureAuthSystem();
     log('Handling ListResources request', { params: request.params });
     const account = await getDefaultAccount();
@@ -855,9 +959,9 @@ function registerResourceHandlers(s: Server): void {
       })),
       nextCursor: res.data.nextPageToken,
     };
-  });
+}
 
-  s.setRequestHandler(ReadResourceRequestSchema, async (request) => {
+async function readResource(request: { params: { uri: string } }) {
     await ensureAuthSystem();
     log('Handling ReadResource request', { uri: request.params.uri });
     const account = await getDefaultAccount();
@@ -872,7 +976,7 @@ function registerResourceHandlers(s: Server): void {
     const mimeType = file.data.mimeType;
 
     if (!mimeType) {
-      throw new Error("File has no MIME type.");
+      throw new ToolFailure('unexpected_response', `Google Drive returned no MIME type for file ${fileId}.`);
     }
 
     if (mimeType.startsWith("application/vnd.google-apps")) {
@@ -929,7 +1033,6 @@ function registerResourceHandlers(s: Server): void {
         };
       }
     }
-  });
 }
 
 // Module-level server instance (used by stdio mode and tests)

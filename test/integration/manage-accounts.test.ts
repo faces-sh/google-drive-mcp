@@ -109,14 +109,13 @@ describe('per-tool account parameter', () => {
     assert.notEqual(result.isError, true, `search errored: ${JSON.stringify(result)}`);
   });
 
-  it('rejects unknown aliases with guidance', async () => {
+  it('rejects unknown aliases in the failure envelope', async () => {
     const result = await callTool(ctx.client, 'search', {
       query: 'anything',
       account: 'nope',
     });
     assert.equal(result.isError, true);
-    assert.match(result.content[0].text!, /Unknown account/);
-    assert.match(result.content[0].text!, /manage_accounts list/);
+    assert.match(result.content[0].text!, /^\[not_found\] Unknown account: "nope"\./);
   });
 
   it('strips account from args before the handler sees them', async () => {
