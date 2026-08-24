@@ -120,6 +120,17 @@ async function ensureAuthSystem(): Promise<AuthSystem> {
     authSystem = await authSystemPromise;
     log('Authentication complete');
     return authSystem;
+  } catch (err) {
+    // Whatever went wrong building the auth system, the caller could not be
+    // authenticated. Anything unclassified here (a raw fs ENOENT on a key file,
+    // a GoogleAuth internal) becomes `no_credentials` rather than escaping as a
+    // protocol error the model never sees.
+    log('Authentication failed', { error: describeErrorForLog(err) });
+    if (err instanceof ToolFailure) throw err;
+    throw new ToolFailure(
+      'no_credentials',
+      `Could not authenticate this server against Google: ${describeErrorForLog(err)}`,
+    );
   } finally {
     authSystemPromise = null;
   }
@@ -770,7 +781,32 @@ function createMcpServer(config: RuntimeConfig = runtimeConfig): Server {
     return { tools: definitions.map(withAccountParam) };
   });
 
+  // The outer try is the contract's boundary, and it has to be the OUTERMOST
+  // thing in this handler. Anything that throws past it leaves the SDK to answer
+  // with a JSON-RPC protocol error, which is not a tool result: it carries no
+  // `isError` flag, the model never sees its text, and Maestro's `declaresFailure`
+  // (a leading `[snake_case_code]`) can never match it. That is exactly what
+  // happened while `await ensureAuthSystem()` sat one line ABOVE the try: with a
+  // credential path that did not exist, all 116 tools answered
+  // `{"error":{"code":-32603,"message":"ENOENT ..."}}` and none of them reached
+  // the envelope below.
   s.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
+    const toolName = request.params.name;
+    try {
+      return await handleCallTool(request, extra);
+    } catch (error) {
+      log('Error escaping the tool request handler', { tool: toolName, error: describeErrorForLog(error) });
+      return failure(`Could not ${humanizeToolName(toolName)}.`, error);
+    }
+  });
+
+  return s;
+}
+
+async function handleCallTool(
+  request: { params: { name: string; arguments?: Record<string, unknown> } },
+  extra: { sessionId?: string; authInfo?: { extra?: Record<string, unknown>; scopes?: string[] } } | undefined,
+): Promise<ToolResult> {
     if (teamRuntime) {
       return handleTeamToolCall(request.params.name, request.params.arguments ?? {}, extra);
     }
@@ -837,9 +873,6 @@ function createMcpServer(config: RuntimeConfig = runtimeConfig): Server {
       log('Error in tool request handler', { error: describeErrorForLog(error) });
       return failure(`Could not ${humanizeToolName(toolName)}.`, error);
     }
-  });
-
-  return s;
 }
 
 // Registers the optional MCP "resources" capability handlers (gdrive:/// file

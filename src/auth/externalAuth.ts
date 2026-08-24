@@ -2,9 +2,13 @@
 // External authentication modes: Service Account & pre-obtained OAuth tokens
 // ---------------------------------------------------------------------------
 
+import { createPrivateKey } from 'crypto';
+import { readFileSync } from 'fs';
 import { OAuth2Client } from 'google-auth-library';
 import { GoogleAuth, GoogleAuthOptions } from 'google-auth-library';
 import { resolveOAuthScopes } from './scopes.js';
+import { ToolFailure } from '../errors.js';
+import { describeErrorForLog } from './utils.js';
 
 // ---------------------------------------------------------------------------
 // Service Account mode
@@ -99,6 +103,65 @@ export function buildServiceAccountAuthOptions(): GoogleAuthOptions {
 }
 
 /**
+ * Check the service account key file is actually usable, at the auth boundary.
+ *
+ * `GoogleAuth.getClient()` accepts a key file it has not really validated and
+ * defers parsing to the first JWT signing, which happens deep inside an API
+ * call. A malformed key therefore surfaced as
+ * `[internal_error] ... error:1E08010C:DECODER routines::unsupported` from
+ * whichever tool the user happened to call: a CREDENTIAL problem wearing the
+ * label of a server bug, which is exactly the distinction this contract exists
+ * to preserve.
+ *
+ * Nothing read here is ever echoed. The parse error is passed through
+ * `describeErrorForLog`, which collapses a SyntaxError to a constant precisely
+ * because Node's own message quotes the unparseable source, and for this file
+ * that source is the private key.
+ */
+function assertUsableServiceAccountKey(keyFile: string): void {
+  let raw: string;
+  try {
+    raw = readFileSync(keyFile, 'utf-8');
+  } catch (err) {
+    throw new ToolFailure(
+      'no_credentials',
+      `Could not read the service account key file at ${keyFile}: ${describeErrorForLog(err)}`,
+    );
+  }
+
+  let key: { type?: unknown; client_email?: unknown; private_key?: unknown };
+  try {
+    key = JSON.parse(raw);
+  } catch (err) {
+    throw new ToolFailure(
+      'invalid_configuration',
+      `The service account key file at ${keyFile} is not valid JSON: ${describeErrorForLog(err)}`,
+    );
+  }
+
+  const missing = (['client_email', 'private_key'] as const).filter((f) => typeof key[f] !== 'string');
+  if (key.type !== 'service_account' || missing.length > 0) {
+    throw new ToolFailure(
+      'invalid_configuration',
+      `The file at ${keyFile} is not a Google service account key` +
+        (missing.length > 0 ? ` (missing: ${missing.join(', ')})` : '') + '.',
+    );
+  }
+
+  try {
+    createPrivateKey(key.private_key as string);
+  } catch (err) {
+    // The OpenSSL failure names a decoder, never the key bytes; even so it goes
+    // through describeErrorForLog and then the envelope's own redaction.
+    throw new ToolFailure(
+      'invalid_configuration',
+      `The private key in the service account key file at ${keyFile} could not be parsed: ` +
+        `${describeErrorForLog(err)}`,
+    );
+  }
+}
+
+/**
  * Create an authorized client from a service account JSON key file.
  * `GoogleAuth` handles JWT signing and token refresh automatically.
  */
@@ -110,10 +173,23 @@ export async function createServiceAccountAuth(): Promise<any> {
       (subject ? ` (impersonating ${subject} via domain-wide delegation)` : ''),
   );
 
-  const auth = new GoogleAuth(options);
-  const client = await auth.getClient();
-  console.error('Service account authentication successful');
-  return client;
+  assertUsableServiceAccountKey(options.keyFile as string);
+
+  try {
+    const auth = new GoogleAuth(options);
+    const client = await auth.getClient();
+    console.error('Service account authentication successful');
+    return client;
+  } catch (err) {
+    // A missing or unreadable key file used to escape as a bare fs ENOENT, which
+    // reached the client as a JSON-RPC protocol error rather than a tool result:
+    // no code, no sentence, and nothing the model ever saw.
+    if (err instanceof ToolFailure) throw err;
+    throw new ToolFailure(
+      'no_credentials',
+      `Could not load the service account key file at ${options.keyFile}: ${describeErrorForLog(err)}`,
+    );
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -132,8 +208,9 @@ export function isExternalTokenMode(): boolean {
 export function validateExternalTokenConfig(): void {
   const accessToken = process.env.GOOGLE_DRIVE_MCP_ACCESS_TOKEN?.trim();
   if (!accessToken) {
-    throw new Error(
-      'GOOGLE_DRIVE_MCP_ACCESS_TOKEN is set but empty. Provide a valid OAuth access token.'
+    throw new ToolFailure(
+      'invalid_configuration',
+      'GOOGLE_DRIVE_MCP_ACCESS_TOKEN is set but empty.',
     );
   }
 
@@ -143,17 +220,19 @@ export function validateExternalTokenConfig(): void {
 
   if (refreshToken) {
     if (!clientId || !clientSecret) {
-      throw new Error(
+      throw new ToolFailure(
+        'invalid_configuration',
         'GOOGLE_DRIVE_MCP_REFRESH_TOKEN is set but GOOGLE_DRIVE_MCP_CLIENT_ID and/or ' +
-          'GOOGLE_DRIVE_MCP_CLIENT_SECRET are missing. All three are required for automatic token refresh.'
+          'GOOGLE_DRIVE_MCP_CLIENT_SECRET are missing; all three are required for automatic token refresh.',
       );
     }
   }
 
   // Warn about partial client credential sets (one without the other)
   if ((clientId && !clientSecret) || (!clientId && clientSecret)) {
-    throw new Error(
-      'Both GOOGLE_DRIVE_MCP_CLIENT_ID and GOOGLE_DRIVE_MCP_CLIENT_SECRET must be provided together.'
+    throw new ToolFailure(
+      'invalid_configuration',
+      'Both GOOGLE_DRIVE_MCP_CLIENT_ID and GOOGLE_DRIVE_MCP_CLIENT_SECRET must be provided together.',
     );
   }
 }
