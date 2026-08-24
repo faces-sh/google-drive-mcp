@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import type { sheets_v4 } from 'googleapis';
 import type { ToolDefinition, ToolResult, ToolContext } from '../types.js';
-import { errorResponse } from '../types.js';
+import { errorResponse, notFound, unexpectedResponse } from '../errors.js';
 import { registerArtifact } from '../resourceHook.js';
 import { parseA1Range, convertA1ToGridRange, escapeDriveQuery, ALL_DRIVES_LIST_PARAMS, type GridRange } from '../utils.js';
 
@@ -726,7 +726,7 @@ async function resolveGridRange(
   const { sheetName, cellRange: a1Range } = parseA1Range(range);
   const sheet = rangeData.data.sheets?.find(s => s.properties?.title === sheetName);
   if (!sheet || sheet.properties?.sheetId === undefined || sheet.properties?.sheetId === null) {
-    return `Sheet "${sheetName}" not found`;
+    return `Sheet "${sheetName}" not found in that spreadsheet.`;
   }
   return convertA1ToGridRange(a1Range, sheet.properties.sheetId!);
 }
@@ -814,8 +814,8 @@ async function handleToolInner(
       const existingFileId = await ctx.checkFileExists(a.name, parentFolderId);
       if (existingFileId) {
         return errorResponse(
-          `A spreadsheet named "${a.name}" already exists in this location. ` +
-          `To update it, use updateGoogleSheet with spreadsheetId: ${existingFileId}`
+          `A spreadsheet named "${a.name}" already exists in this location (id ${existingFileId}).`,
+          'already_exists',
         );
       }
       const sheets = ctx.google.sheets({ version: 'v4', auth: ctx.authClient });
@@ -938,7 +938,7 @@ async function handleToolInner(
       const sheet = rangeData.data.sheets?.find(s => s.properties?.title === sheetName);
 
       if (!sheet || sheet.properties?.sheetId === undefined || sheet.properties?.sheetId === null) {
-        return errorResponse(`Sheet "${sheetName}" not found`);
+        return notFound(`Sheet "${sheetName}" not found in that spreadsheet.`);
       }
 
       // Parse A1 notation to grid range
@@ -1000,7 +1000,7 @@ async function handleToolInner(
       const { sheetName, cellRange: a1Range } = parseA1Range(a.range);
       const sheet = rangeData.data.sheets?.find(s => s.properties?.title === sheetName);
       if (!sheet || sheet.properties?.sheetId === undefined || sheet.properties?.sheetId === null) {
-        return errorResponse(`Sheet "${sheetName}" not found`);
+        return notFound(`Sheet "${sheetName}" not found in that spreadsheet.`);
       }
 
       const gridRange = convertA1ToGridRange(a1Range, sheet.properties.sheetId!);
@@ -1080,7 +1080,7 @@ async function handleToolInner(
       const { sheetName, cellRange: a1Range } = parseA1Range(a.range);
       const sheet = rangeData.data.sheets?.find(s => s.properties?.title === sheetName);
       if (!sheet || sheet.properties?.sheetId === undefined || sheet.properties?.sheetId === null) {
-        return errorResponse(`Sheet "${sheetName}" not found`);
+        return notFound(`Sheet "${sheetName}" not found in that spreadsheet.`);
       }
 
       const gridRange = convertA1ToGridRange(a1Range, sheet.properties.sheetId!);
@@ -1131,7 +1131,7 @@ async function handleToolInner(
       const { sheetName, cellRange: a1Range } = parseA1Range(a.range);
       const sheet = rangeData.data.sheets?.find(s => s.properties?.title === sheetName);
       if (!sheet || sheet.properties?.sheetId === undefined || sheet.properties?.sheetId === null) {
-        return errorResponse(`Sheet "${sheetName}" not found`);
+        return notFound(`Sheet "${sheetName}" not found in that spreadsheet.`);
       }
 
       const gridRange = convertA1ToGridRange(a1Range, sheet.properties.sheetId!);
@@ -1188,7 +1188,7 @@ async function handleToolInner(
       const { sheetName, cellRange: a1Range } = parseA1Range(a.range);
       const sheet = rangeData.data.sheets?.find(s => s.properties?.title === sheetName);
       if (!sheet || sheet.properties?.sheetId === undefined || sheet.properties?.sheetId === null) {
-        return errorResponse(`Sheet "${sheetName}" not found`);
+        return notFound(`Sheet "${sheetName}" not found in that spreadsheet.`);
       }
 
       const gridRange = convertA1ToGridRange(a1Range, sheet.properties.sheetId!);
@@ -1229,7 +1229,7 @@ async function handleToolInner(
       const { sheetName, cellRange: a1Range } = parseA1Range(a.range);
       const sheet = rangeData.data.sheets?.find(s => s.properties?.title === sheetName);
       if (!sheet || sheet.properties?.sheetId === undefined || sheet.properties?.sheetId === null) {
-        return errorResponse(`Sheet "${sheetName}" not found`);
+        return notFound(`Sheet "${sheetName}" not found in that spreadsheet.`);
       }
 
       const gridRange = convertA1ToGridRange(a1Range, sheet.properties.sheetId!);
@@ -1400,7 +1400,7 @@ async function handleToolInner(
 
       const addedSheet = response.data.replies?.[0]?.addSheet?.properties;
       if (!addedSheet) {
-        return errorResponse('Failed to add sheet - no sheet properties returned.');
+        return unexpectedResponse('Google Sheets accepted the new sheet but returned no properties for it.');
       }
 
       return {
@@ -1475,7 +1475,7 @@ async function handleToolInner(
 
       const sheets = ctx.google.sheets({ version: 'v4', auth: ctx.authClient });
       const gridRange = await resolveGridRange(sheets, a.spreadsheetId, a.range);
-      if (typeof gridRange === 'string') return errorResponse(gridRange);
+      if (typeof gridRange === 'string') return notFound(gridRange);
 
       // ONE_OF_RANGE expects a single range formula (leading "="); accept plain
       // A1 notation and normalise so callers don't need to know the quirk.
@@ -1512,7 +1512,7 @@ async function handleToolInner(
 
       const sheets = ctx.google.sheets({ version: 'v4', auth: ctx.authClient });
       const gridRange = await resolveGridRange(sheets, a.spreadsheetId, a.range);
-      if (typeof gridRange === 'string') return errorResponse(gridRange);
+      if (typeof gridRange === 'string') return notFound(gridRange);
 
       const response = await sheets.spreadsheets.batchUpdate({
         spreadsheetId: a.spreadsheetId,
@@ -1540,7 +1540,7 @@ async function handleToolInner(
 
       const sheets = ctx.google.sheets({ version: 'v4', auth: ctx.authClient });
       const gridRange = await resolveGridRange(sheets, a.spreadsheetId, a.range);
-      if (typeof gridRange === 'string') return errorResponse(gridRange);
+      if (typeof gridRange === 'string') return notFound(gridRange);
 
       const response = await sheets.spreadsheets.batchUpdate({
         spreadsheetId: a.spreadsheetId,

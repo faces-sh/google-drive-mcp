@@ -2,12 +2,13 @@ import { Readable } from 'stream';
 import { z } from 'zod';
 import JSZip from 'jszip';
 import type { ToolDefinition, ToolContext, ToolResult } from '../types.js';
-import { errorResponse } from '../types.js';
+import { ToolFailure, errorResponse, failure, notFound, toolFailure, unexpectedResponse } from '../errors.js';
 import { escapeDriveQuery, isTextMime, ALL_DRIVES_LIST_PARAMS } from '../utils.js';
 import { downloadTextContent, writeTextContent } from './text-content.js';
 import { uploadImageToDrive } from '../utils/driveImageUpload.js';
 import { withRetry } from '../utils/retry.js';
 import { registerArtifact } from '../resourceHook.js';
+import { describeErrorForLog } from '../auth/utils.js';
 import { createHash } from 'node:crypto';
 
 // Deterministic loop-breaker for a small dispatcher model. Observed failure: getGoogleDocContent called 4x
@@ -702,10 +703,12 @@ async function executeBatchUpdate(ctx: ToolContext, documentId: string, requests
     });
     return response.data;
   } catch (error: any) {
-    ctx.log('Google Docs batchUpdate error:', error.message);
-    if (error.code === 404) throw new Error(`Document not found (ID: ${documentId})`);
-    if (error.code === 403) throw new Error(`Permission denied for document (ID: ${documentId})`);
-    throw new Error(`Google Docs API Error: ${error.message}`);
+    // This used to READ the status and then throw the evidence away: a 403 became
+    // "Permission denied for document (ID: ...)", which cannot tell an expired
+    // credential from a document the account was never shared on. Keep the status
+    // line and Google's body; deciding what they mean is the caller's job.
+    ctx.log('Google Docs batchUpdate error:', describeErrorForLog(error));
+    throw toolFailure(`Could not apply the edit to document ${documentId}.`, error);
   }
 }
 
@@ -724,7 +727,7 @@ async function getTabBodyContent(
   const tabs = (res.data as any).tabs as any[] | undefined;
   const tab = tabs ? findTabById(tabs, tabId) : null;
   if (!tab) {
-    return { error: `Tab with ID "${tabId}" not found. Use listDocumentTabs to see available tabs.` };
+    return { error: `Tab with ID "${tabId}" not found in document ${documentId}.` };
   }
   return { content: tab.documentTab?.body?.content ?? [] };
 }
@@ -839,9 +842,8 @@ async function findTextRange(ctx: ToolContext, documentId: string, textToFind: s
 
     return null;
   } catch (error: any) {
-    ctx.log('Error finding text in document:', error.message);
-    if (error.code === 404) throw new Error(`Document not found (ID: ${documentId})`);
-    throw new Error(`Failed to search document: ${error.message}`);
+    ctx.log('Error finding text in document:', describeErrorForLog(error));
+    throw toolFailure(`Could not search document ${documentId}.`, error);
   }
 }
 
@@ -899,8 +901,8 @@ async function getParagraphRange(ctx: ToolContext, documentId: string, indexWith
 
     return findParagraphInContent(content);
   } catch (error: any) {
-    ctx.log('Error getting paragraph range:', error.message);
-    throw new Error(`Failed to find paragraph: ${error.message}`);
+    ctx.log('Error getting paragraph range:', describeErrorForLog(error));
+    throw toolFailure(`Could not locate the paragraph in document ${documentId}.`, error);
   }
 }
 
@@ -934,14 +936,14 @@ function buildUpdateTextStyleRequest(
 
   if (style.foregroundColor !== undefined) {
     const rgbColor = hexToRgbColor(style.foregroundColor);
-    if (!rgbColor) throw new Error(`Invalid foreground hex color: ${style.foregroundColor}`);
+    if (!rgbColor) throw new ToolFailure('bad_request', `That is not a valid hex colour: ${style.foregroundColor}`);
     textStyle.foregroundColor = { color: { rgbColor } };
     fieldsToUpdate.push('foregroundColor');
   }
 
   if (style.backgroundColor !== undefined) {
     const rgbColor = hexToRgbColor(style.backgroundColor);
-    if (!rgbColor) throw new Error(`Invalid background hex color: ${style.backgroundColor}`);
+    if (!rgbColor) throw new ToolFailure('bad_request', `That is not a valid hex colour: ${style.backgroundColor}`);
     textStyle.backgroundColor = { color: { rgbColor } };
     fieldsToUpdate.push('backgroundColor');
   }
@@ -1023,7 +1025,7 @@ async function insertInlineImageHelper(
   try {
     new URL(imageUrl);
   } catch (_e) {
-    throw new Error(`Invalid image URL format: ${imageUrl}`);
+    throw new ToolFailure('bad_request', `That is not a valid image URL: ${imageUrl}`);
   }
 
   const request: any = {
@@ -2492,8 +2494,8 @@ async function handleToolInner(toolName: string, args: Record<string, unknown>, 
       const existingFileId = await ctx.checkFileExists(a.name, parentFolderId);
       if (existingFileId) {
         return errorResponse(
-          `A document named "${a.name}" already exists in this location. ` +
-          `To update it, use updateGoogleDoc with documentId: ${existingFileId}`
+          `A document named "${a.name}" already exists in this location (id ${existingFileId}).`,
+          'already_exists',
         );
       }
 
@@ -2548,15 +2550,16 @@ async function handleToolInner(toolName: string, args: Record<string, unknown>, 
           ctx.log
         );
       } catch (batchErr: any) {
-        ctx.log('batchUpdate failed after retries; doc created without content:', batchErr);
-        const reason = String(batchErr?.message ?? 'unknown error').split('\n')[0].slice(0, 200);
-        return {
-          content: [{
-            type: "text",
-            text: `Created Google Doc but content insertion failed: ${doc.name}\nID: ${doc.id}\nLink: ${doc.webViewLink}\nReason: ${reason}\nRetry content insertion with updateGoogleDoc (documentId: ${doc.id}).`
-          }],
-          isError: true
-        };
+        // The document is real and empty. That is a FAILURE of this call, not a
+        // success with a caveat: Maestro once read the old wording as "created"
+        // and told the user their document had the content in it. Line 1 carries
+        // the id, because the document exists and the caller needs to be able to
+        // address it; the reason stays Google's, verbatim.
+        ctx.log('batchUpdate failed after retries; doc created without content:', describeErrorForLog(batchErr));
+        return failure(
+          `Created the Google Doc "${doc.name}" (id ${doc.id}) but could not put any content in it, so it is empty.`,
+          batchErr,
+        );
       }
 
       return {
@@ -2578,8 +2581,8 @@ async function handleToolInner(toolName: string, args: Record<string, unknown>, 
       const existingFileId = await ctx.checkFileExists(a.name, parentFolderId);
       if (existingFileId) {
         return errorResponse(
-          `A document named "${a.name}" already exists in this location. ` +
-          `Use a different name or delete the existing doc (ID: ${existingFileId}).`
+          `A document named "${a.name}" already exists in this location (id ${existingFileId}).`,
+          'already_exists',
         );
       }
 
@@ -2641,7 +2644,7 @@ async function handleToolInner(toolName: string, args: Record<string, unknown>, 
         const tabs = (document.data as any).tabs as any[] | undefined;
         const tab = tabs ? findTabById(tabs, a.tabId) : null;
         if (!tab) {
-          return errorResponse(`Tab with ID "${a.tabId}" not found. Use listDocumentTabs to see available tabs.`);
+          return notFound(`Tab with ID "${a.tabId}" not found in document ${a.documentId}.`);
         }
 
         const bodyContent = tab.documentTab?.body?.content;
@@ -2784,9 +2787,7 @@ async function handleToolInner(toolName: string, args: Record<string, unknown>, 
 
       const embedded = findInlineObjectById(docResponse.data, a.inlineObjectId);
       if (!embedded) {
-        return errorResponse(
-          `Inline object "${a.inlineObjectId}" not found in document. Use readGoogleDoc or getGoogleDocContent to list valid inline image objectIds.`
-        );
+        return notFound(`Inline object "${a.inlineObjectId}" not found in document ${a.documentId}.`);
       }
       const contentUri = embedded.imageProperties?.contentUri;
       if (!contentUri) {
@@ -2797,11 +2798,13 @@ async function handleToolInner(toolName: string, args: Record<string, unknown>, 
         const sourceUri = embedded.imageProperties?.sourceUri;
         if (sourceUri) {
           return errorResponse(
-            `Inline object "${a.inlineObjectId}" has no Google-hosted image to fetch; it references an external source URL that this tool does not retrieve: ${sourceUri} — fetch it directly.`
+            `Inline object "${a.inlineObjectId}" has no Google-hosted image to fetch; it references an external source URL that this tool does not retrieve: ${sourceUri}`,
+            'unsupported',
           );
         }
         return errorResponse(
-          `Inline object "${a.inlineObjectId}" has no fetchable image content (e.g. an embedded chart or drawing rather than a raster image).`
+          `Inline object "${a.inlineObjectId}" has no fetchable image content (e.g. an embedded chart or drawing rather than a raster image).`,
+          'unsupported',
         );
       }
 
@@ -2818,7 +2821,8 @@ async function handleToolInner(toolName: string, args: Record<string, unknown>, 
 
       if (buffer.byteLength > MAX_IMAGE_BYTES) {
         return errorResponse(
-          `Image is too large to return inline (${(buffer.byteLength / (1024 * 1024)).toFixed(1)} MB, limit 40 MB).`
+          `Image is too large to return inline (${(buffer.byteLength / (1024 * 1024)).toFixed(1)} MB, limit 40 MB).`,
+          'too_large',
         );
       }
 
@@ -3217,10 +3221,10 @@ async function handleToolInner(toolName: string, args: Record<string, unknown>, 
           a.tabId
         );
         if (range && 'error' in range) {
-          return errorResponse(range.error);
+          return notFound(range.error);
         }
         if (!range) {
-          return errorResponse(`Text "${a.textToFind}" not found in document`);
+          return notFound(`Text "${a.textToFind}" not found in document ${a.documentId}.`);
         }
         startIndex = range.startIndex;
         endIndex = range.endIndex;
@@ -3287,7 +3291,7 @@ async function handleToolInner(toolName: string, args: Record<string, unknown>, 
         if (a.tabId) {
           const resolved = await getTabBodyContent(ctx, a.documentId, a.tabId);
           if (resolved.error) {
-            return errorResponse(resolved.error);
+            return notFound(resolved.error);
           }
           tabContent = resolved.content;
         }
@@ -3301,28 +3305,28 @@ async function handleToolInner(toolName: string, args: Record<string, unknown>, 
           tabContent
         );
         if (range && 'error' in range) {
-          return errorResponse(range.error);
+          return notFound(range.error);
         }
         if (!range) {
-          return errorResponse(`Text "${a.textToFind}" not found in document`);
+          return notFound(`Text "${a.textToFind}" not found in document ${a.documentId}.`);
         }
         // For paragraph style, get the full paragraph range
         const paraRange = await getParagraphRange(ctx, a.documentId, range.startIndex, a.tabId, tabContent);
         if (paraRange && 'error' in paraRange) {
-          return errorResponse(paraRange.error);
+          return notFound(paraRange.error);
         }
         if (!paraRange) {
-          return errorResponse("Could not determine paragraph boundaries");
+          return notFound('Could not determine the paragraph boundaries at that position.');
         }
         startIndex = paraRange.startIndex;
         endIndex = paraRange.endIndex;
       } else if (a.indexWithinParagraph !== undefined) {
         const paraRange = await getParagraphRange(ctx, a.documentId, a.indexWithinParagraph, a.tabId);
         if (paraRange && 'error' in paraRange) {
-          return errorResponse(paraRange.error);
+          return notFound(paraRange.error);
         }
         if (!paraRange) {
-          return errorResponse("Could not determine paragraph boundaries");
+          return notFound('Could not determine the paragraph boundaries at that position.');
         }
         startIndex = paraRange.startIndex;
         endIndex = paraRange.endIndex;
@@ -3384,10 +3388,10 @@ async function handleToolInner(toolName: string, args: Record<string, unknown>, 
           a.tabId
         );
         if (range && 'error' in range) {
-          return errorResponse(range.error);
+          return notFound(range.error);
         }
         if (!range) {
-          return errorResponse(`Text "${a.textToFind}" not found in document`);
+          return notFound(`Text "${a.textToFind}" not found in document ${a.documentId}.`);
         }
         startIndex = range.startIndex;
         endIndex = range.endIndex;
@@ -3536,7 +3540,7 @@ async function handleToolInner(toolName: string, args: Record<string, unknown>, 
         });
         isGoogleDoc = fileInfo.data.mimeType === 'application/vnd.google-apps.document';
       } catch (err) {
-        ctx.log('Failed to check file MIME type:', err);
+        ctx.log('Failed to check file MIME type:', describeErrorForLog(err));
       }
 
       if (isGoogleDoc) {
@@ -3602,7 +3606,7 @@ async function handleToolInner(toolName: string, args: Record<string, unknown>, 
 
           needsDocxFallback = ambiguousComments.length > 0;
         } catch (err) {
-          ctx.log('Tier 1 context extraction failed:', err);
+          ctx.log('Tier 1 context extraction failed:', describeErrorForLog(err));
           needsDocxFallback = true;
         }
       }
@@ -3623,7 +3627,7 @@ async function handleToolInner(toolName: string, args: Record<string, unknown>, 
               matchDocxToDriveComments(comments, docxResult, contextMap, flatText, offsetMap);
             }
           } catch (err) {
-            ctx.log('Tier 2 DOCX context extraction failed:', err);
+            ctx.log('Tier 2 DOCX context extraction failed:', describeErrorForLog(err));
           }
         }
       }
@@ -3868,7 +3872,7 @@ async function handleToolInner(toolName: string, args: Record<string, unknown>, 
       if (a.tabId) {
         const resolved = await getTabBodyContent(ctx, a.documentId, a.tabId);
         if (resolved.error) {
-          return errorResponse(resolved.error);
+          return notFound(resolved.error);
         }
         docContent = resolved.content;
       } else {
@@ -3895,18 +3899,18 @@ async function handleToolInner(toolName: string, args: Record<string, unknown>, 
       }
 
       if (!table) {
-        return errorResponse(`No table found at index ${a.tableStartIndex}`);
+        return notFound(`No table found at index ${a.tableStartIndex}.`);
       }
 
       // Get the cell
       const row = table.tableRows?.[a.rowIndex];
       if (!row) {
-        return errorResponse(`Row ${a.rowIndex} not found in table`);
+        return notFound(`Row ${a.rowIndex} not found in that table.`);
       }
 
       const cell = row.tableCells?.[a.columnIndex];
       if (!cell) {
-        return errorResponse(`Column ${a.columnIndex} not found in row ${a.rowIndex}`);
+        return notFound(`Column ${a.columnIndex} not found in row ${a.rowIndex}.`);
       }
 
       // Get cell content range
@@ -4100,7 +4104,7 @@ async function handleToolInner(toolName: string, args: Record<string, unknown>, 
       const file = response.data;
 
       if (!file) {
-        return errorResponse(`Document with ID ${a.documentId} not found.`);
+        return notFound(`Document with ID ${a.documentId} not found.`);
       }
 
       const createdDate = file.createdTime ? new Date(file.createdTime).toLocaleString() : 'Unknown';
@@ -4238,7 +4242,7 @@ async function handleToolInner(toolName: string, args: Record<string, unknown>, 
 
       const footnoteId = res.data.replies?.[0]?.createFootnote?.footnoteId;
       if (!footnoteId) {
-        return errorResponse("Failed to create footnote — no footnoteId in response.");
+        return unexpectedResponse('Google Docs accepted the footnote but returned no footnote id for it.');
       }
 
       const locationDesc = `${a.index !== undefined ? `at index ${a.index}` : 'at end of document'}${a.tabId ? ` in tab ${a.tabId}` : ''}`;
@@ -4258,7 +4262,10 @@ async function handleToolInner(toolName: string, args: Record<string, unknown>, 
             },
           });
         } catch (err: any) {
-          return { content: [{ type: 'text', text: `Created footnote ${footnoteId} ${locationDesc}, but failed to insert content: ${err.message}` }], isError: true };
+          return failure(
+            `Created footnote ${footnoteId} ${locationDesc} but could not put any content in it, so it is empty.`,
+            err,
+          );
         }
       }
 

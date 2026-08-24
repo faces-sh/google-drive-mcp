@@ -202,7 +202,7 @@ test('factory.evict drops the cached client so the next getClient rebuilds', asy
   }
 });
 
-test('factory surfaces invalid_grant as an actionable reconnect error (finding 5)', async () => {
+test('factory surfaces invalid_grant in the failure envelope (finding 5)', async () => {
   const { tokenPath, cleanup } = await setupTmpCredentials();
   try {
     const store = new AccountStore({ filePath: tokenPath, mode: 'local-oauth' });
@@ -227,8 +227,13 @@ test('factory surfaces invalid_grant as an actionable reconnect error (finding 5
     await assert.rejects(
       () => factory.getClient('work'),
       (err: Error) => {
+        // The envelope, not a paraphrase: the code says it is a credential
+        // problem and Google's own `invalid_grant` survives in the text.
+        assert.match(err.message, /^\[no_credentials\] /);
         assert.match(err.message, /revoked or has expired/);
-        assert.match(err.message, /manage_accounts add work/);
+        assert.match(err.message, /invalid_grant/);
+        // Rule 7: no invented remedy.
+        assert.doesNotMatch(err.message, /manage_accounts/);
         return true;
       },
     );

@@ -1,6 +1,7 @@
 import { OAuth2Client } from 'google-auth-library';
 import * as fs from 'fs/promises';
 import { describeErrorForLog, getKeysFilePaths, generateCredentialsErrorMessage, OAuthCredentials } from './utils.js';
+import { ToolFailure } from '../errors.js';
 
 function parseCredentialsFile(keys: Record<string, unknown>): OAuthCredentials {
   if (keys.installed) {
@@ -16,7 +17,10 @@ function parseCredentialsFile(keys: Record<string, unknown>): OAuthCredentials {
       redirect_uris: (keys.redirect_uris as string[] | undefined) || ['http://127.0.0.1:3000/oauth2callback']
     };
   } else {
-    throw new Error('Invalid credentials file format. Expected either "installed", "web" object or direct client_id field.');
+    throw new ToolFailure(
+      'invalid_configuration',
+      'The credentials file has no "installed", "web" or direct client_id entry.',
+    );
   }
 }
 
@@ -34,13 +38,16 @@ async function loadCredentialsFromFile(): Promise<OAuthCredentials> {
           (err instanceof Error && err.message.includes('Invalid credentials'))) {
         // describeErrorForLog collapses a JSON.parse SyntaxError to a constant
         // rather than echoing file fragments (which may include the client_secret).
-        throw new Error(`Invalid credentials file at ${keysPath}: ${describeErrorForLog(err)}`);
+        throw new ToolFailure(
+          'invalid_configuration',
+          `Invalid credentials file at ${keysPath}: ${describeErrorForLog(err)}`,
+        );
       }
       // File not found — try next path
     }
   }
 
-  throw new Error(`Credentials file not found. Searched: ${paths.join(', ')}`);
+  throw new ToolFailure('no_credentials', `Credentials file not found. Searched: ${paths.join(', ')}`);
 }
 
 async function loadCredentialsWithFallback(): Promise<OAuthCredentials> {
@@ -62,9 +69,15 @@ async function loadCredentialsWithFallback(): Promise<OAuthCredentials> {
         throw new Error('Invalid legacy credentials format');
       }
     } catch (_legacyError) {
-      // Generate helpful error message
-      const errorMessage = generateCredentialsErrorMessage();
-      throw new Error(`${errorMessage}\n\nOriginal error: ${fileError instanceof Error ? fileError.message : fileError}`);
+      // The setup walkthrough is guidance, not evidence, so it goes to the log
+      // (where an operator running `auth` sees it) and not into the failure a
+      // tool result carries.
+      console.error(generateCredentialsErrorMessage());
+      if (fileError instanceof ToolFailure) throw fileError;
+      throw new ToolFailure(
+        'no_credentials',
+        `No OAuth client credentials found: ${fileError instanceof Error ? fileError.message : String(fileError)}`,
+      );
     }
   }
 }
@@ -80,7 +93,11 @@ export async function initializeOAuth2Client(): Promise<OAuth2Client> {
       redirectUri: credentials.redirect_uris?.[0] || 'http://127.0.0.1:3000/oauth2callback',
     });
   } catch (error) {
-    throw new Error(`Error loading OAuth keys: ${error instanceof Error ? error.message : error}`);
+    if (error instanceof ToolFailure) throw error;
+    throw new ToolFailure(
+      'no_credentials',
+      `Error loading OAuth keys: ${error instanceof Error ? error.message : String(error)}`,
+    );
   }
 }
 
@@ -120,7 +137,10 @@ export async function loadWebCredentials(
         // Do not interpolate the raw SyntaxError message: in Node it echoes a
         // snippet of the unparseable file, which for gcp-oauth.keys.json is the
         // client_secret. describeErrorForLog returns a constant for SyntaxError.
-        throw new Error(`Invalid credentials file at ${keysPath}: ${describeErrorForLog(err)}`);
+        throw new ToolFailure(
+          'invalid_configuration',
+          `Invalid credentials file at ${keysPath}: ${describeErrorForLog(err)}`,
+        );
       }
       continue; // not found — try the next path
     }
@@ -136,16 +156,19 @@ export async function loadWebCredentials(
       };
     }
     if (keys.installed) {
-      throw new Error(
+      throw new ToolFailure(
+        'invalid_configuration',
         `The credentials file at ${keysPath} contains a desktop-type ("installed") OAuth ` +
           `client, which Google restricts to loopback redirect URIs.\n${webClientHint}`,
       );
     }
-    throw new Error(
+    throw new ToolFailure(
+      'invalid_configuration',
       `The credentials file at ${keysPath} has no usable "web" client entry.\n${webClientHint}`,
     );
   }
-  throw new Error(
+  throw new ToolFailure(
+    'no_credentials',
     `No team-mode OAuth client credentials found (searched: ${paths.join(', ')}).\n${webClientHint}`,
   );
 }
@@ -153,15 +176,19 @@ export async function loadWebCredentials(
 export async function loadCredentials(): Promise<{ client_id: string; client_secret?: string }> {
   try {
     const credentials = await loadCredentialsWithFallback();
-    
+
     if (!credentials.client_id) {
-        throw new Error('Client ID missing in credentials.');
+      throw new ToolFailure('invalid_configuration', 'The credentials file has no client_id.');
     }
     return {
       client_id: credentials.client_id,
       client_secret: credentials.client_secret
     };
   } catch (error) {
-    throw new Error(`Error loading credentials: ${error instanceof Error ? error.message : error}`);
+    if (error instanceof ToolFailure) throw error;
+    throw new ToolFailure(
+      'no_credentials',
+      `Could not load the OAuth client credentials: ${error instanceof Error ? error.message : String(error)}`,
+    );
   }
 }

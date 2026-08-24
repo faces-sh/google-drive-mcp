@@ -345,7 +345,7 @@ describe('Team mode — bearer-guarded per-user dispatch', () => {
     const body = await parseResponse(await mcpPost(bearer, sid, toolsCall('search', { query: 'x' })));
     assert.equal(body.result.isError, true);
     assert.match(body.result.content[0].text, /lacks the required scope/);
-    assert.match(body.result.content[0].text, /Reconnect this connector/);
+    assert.match(body.result.content[0].text, /^\[insufficient_scope\] /);
   });
 
   it('enforces the bearer token\'s own scopes, not just the Google grant', async () => {

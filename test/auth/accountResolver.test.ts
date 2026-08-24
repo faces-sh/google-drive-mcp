@@ -101,10 +101,10 @@ test('resolver: explicit string without acceptable scopes throws the scope-short
         acceptableScopes: [SCOPE_DRIVE],
       }),
     (err: Error) => {
+      assert.match(err.message, /^\[insufficient_scope\] /);
       assert.match(err.message, /Account 'personal' is connected but lacks the required scope/);
-      // Recovery must be non-destructive: a single in-place re-consent, no remove.
-      assert.match(err.message, /manage_accounts add personal/);
-      assert.doesNotMatch(err.message, /manage_accounts remove/);
+      // Rule 7: name the shortage, never prescribe the recovery.
+      assert.doesNotMatch(err.message, /manage_accounts/);
       assert.match(err.message, new RegExp(SCOPE_DRIVE.replace(/\//g, '\\/')));
       return true;
     },
@@ -207,8 +207,10 @@ test('resolver: scope-short global default errors instead of silently routing el
         acceptableScopes: [SCOPE_DRIVE],
       }),
     (err: Error) => {
+      assert.match(err.message, /^\[insufficient_scope\] /);
       assert.match(err.message, /Account 'personal' is connected but lacks the required scope/);
-      assert.match(err.message, /manage_accounts add personal/);
+      // Rule 7: name the shortage, never prescribe the recovery.
+      assert.doesNotMatch(err.message, /manage_accounts/);
       // Must name the configured default, not the substitute account.
       assert.doesNotMatch(err.message, /\bwork\b/);
       return true;
@@ -247,6 +249,7 @@ test('resolver: scope-short session default errors, naming the session alias', a
         acceptableScopes: [SCOPE_DRIVE],
       }),
     (err: Error) => {
+      assert.match(err.message, /^\[insufficient_scope\] /);
       assert.match(err.message, /Account 'personal' is connected but lacks the required scope/);
       assert.doesNotMatch(err.message, /\bwork\b/);
       return true;
@@ -282,7 +285,7 @@ test('resolver: merged-eligible fanout for reads when multiple eligible', async 
   assert.equal(t.accounts.length, 2);
 });
 
-test('resolver: ambiguous write points at manage_accounts set_default', async () => {
+test('resolver: ambiguous write refuses instead of picking one', async () => {
   const { resolver } = await buildResolver([
     makeRecord('a', SCOPE_DRIVE),
     makeRecord('b', SCOPE_DRIVE),
@@ -294,8 +297,10 @@ test('resolver: ambiguous write points at manage_accounts set_default', async ()
         acceptableScopes: [SCOPE_DRIVE],
       }),
     (err: Error) => {
-      assert.match(err.message, /Multiple accounts have required scopes/);
-      assert.match(err.message, /manage_accounts set_default/);
+      assert.match(err.message, /^\[bad_request\] /);
+      assert.match(err.message, /Multiple accounts have the required scopes/);
+      // Rule 7: name the ambiguity, never prescribe the recovery.
+      assert.doesNotMatch(err.message, /manage_accounts/);
       assert.match(err.message, /\ba\b.*\bb\b/);
       return true;
     },
@@ -310,7 +315,7 @@ test('resolver: no accounts at all throws', async () => {
         sessionId: STDIO_SESSION_ID,
         acceptableScopes: [SCOPE_DRIVE],
       }),
-    /No accounts are authenticated/,
+    /\[no_credentials\] No Google account is authenticated on this server\./,
   );
 });
 
@@ -323,10 +328,10 @@ test('resolver: sole-account scope mismatch throws the scope-shortage message', 
         acceptableScopes: [SCOPE_DRIVE],
       }),
     (err: Error) => {
+      assert.match(err.message, /^\[insufficient_scope\] /);
       assert.match(err.message, /Account 'only' is connected but lacks the required scope/);
-      // Recovery must be non-destructive: a single in-place re-consent, no remove.
-      assert.match(err.message, /manage_accounts add only/);
-      assert.doesNotMatch(err.message, /manage_accounts remove/);
+      // Rule 7: name the shortage, never prescribe the recovery.
+      assert.doesNotMatch(err.message, /manage_accounts/);
       return true;
     },
   );
@@ -344,10 +349,10 @@ test('resolver: multiple accounts, none eligible, throws the generic shortage me
         acceptableScopes: [SCOPE_DRIVE],
       }),
     (err: Error) => {
+      assert.match(err.message, /^\[insufficient_scope\] /);
       assert.match(err.message, /No authenticated account has any of the required scopes/);
-      assert.match(err.message, /manage_accounts add/);
-      // Recovery advice must be non-destructive: in-place re-consent, no remove.
-      assert.doesNotMatch(err.message, /manage_accounts remove/);
+      // Rule 7: name the shortage, never prescribe the recovery.
+      assert.doesNotMatch(err.message, /manage_accounts/);
       return true;
     },
   );

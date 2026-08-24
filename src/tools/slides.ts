@@ -2,7 +2,8 @@ import { z } from 'zod';
 import { v4 as uuidv4 } from 'uuid';
 import type { slides_v1 } from 'googleapis';
 import type { ToolDefinition, ToolResult, ToolContext } from '../types.js';
-import { errorResponse } from '../types.js';
+import { errorResponse, notFound, unexpectedResponse } from '../errors.js';
+import { describeErrorForLog } from '../auth/utils.js';
 import { uploadImageToDrive, deleteDriveFile } from '../utils/driveImageUpload.js';
 
 // ---------------------------------------------------------------------------
@@ -663,8 +664,8 @@ export async function handleTool(
       const existingFileId = await ctx.checkFileExists(a.name, parentFolderId);
       if (existingFileId) {
         return errorResponse(
-          `A presentation named "${a.name}" already exists in this location. ` +
-          `File ID: ${existingFileId}. To modify it, you can use Google Slides directly.`
+          `A presentation named "${a.name}" already exists in this location (id ${existingFileId}).`,
+          'already_exists',
         );
       }
 
@@ -744,7 +745,7 @@ export async function handleTool(
       });
 
       if (!currentPresentation.data.slides) {
-        return errorResponse("No slides found in presentation");
+        return notFound('That presentation has no slides.');
       }
 
       // Collect all slide IDs except the first one (we'll keep it for now)
@@ -914,7 +915,7 @@ export async function handleTool(
       });
 
       if (!presentation.data.slides) {
-        return errorResponse("No slides found in presentation");
+        return notFound('That presentation has no slides.');
       }
 
       let content = 'Presentation content with element IDs:\n\n';
@@ -1416,7 +1417,7 @@ export async function handleTool(
       });
 
       if (!presentation.data.slides || a.slideIndex >= presentation.data.slides.length) {
-        return errorResponse(`Slide index ${a.slideIndex} not found in presentation (has ${presentation.data.slides?.length ?? 0} slides)`);
+        return notFound(`Slide index ${a.slideIndex} not found in that presentation (it has ${presentation.data.slides?.length ?? 0} slides).`);
       }
 
       const slide = presentation.data.slides[a.slideIndex];
@@ -1492,7 +1493,7 @@ export async function handleTool(
       });
 
       if (!presentation.data.slides || a.slideIndex >= presentation.data.slides.length) {
-        return errorResponse(`Slide index ${a.slideIndex} not found in presentation (has ${presentation.data.slides?.length ?? 0} slides)`);
+        return notFound(`Slide index ${a.slideIndex} not found in that presentation (it has ${presentation.data.slides?.length ?? 0} slides).`);
       }
 
       const slide = presentation.data.slides[a.slideIndex];
@@ -1501,7 +1502,7 @@ export async function handleTool(
       const notesObjectId = slide.slideProperties?.notesPage?.notesProperties?.speakerNotesObjectId;
 
       if (!notesObjectId) {
-        return errorResponse("This slide does not have a speaker notes object. Speaker notes may need to be initialized manually in Google Slides first.");
+        return notFound('That slide has no speaker notes object.');
       }
 
       // Create the batchUpdate request to replace the speaker notes text
@@ -1639,7 +1640,7 @@ export async function handleTool(
       });
 
       const url = response.data?.contentUrl;
-      if (!url) return errorResponse('No thumbnail URL returned by Google Slides API.');
+      if (!url) return unexpectedResponse('Google Slides returned no thumbnail URL for that slide.');
 
       return {
         content: [{ type: 'text', text: `Slide thumbnail URL (${a.mimeType}, ${a.size}): ${url}` }],
@@ -1735,7 +1736,7 @@ export async function handleTool(
       }
 
       if (!currentTransform) {
-        return errorResponse(`Element ${a.objectId} not found in presentation`);
+        return notFound(`Element ${a.objectId} not found in that presentation.`);
       }
 
       const origWidth = currentSize?.width?.magnitude || 3000000;
@@ -1823,7 +1824,7 @@ export async function handleTool(
         // Drive file is no longer referenced. Delete it (which also removes the
         // public permission we just granted).
         await deleteDriveFile(ctx, fileId).catch((err) =>
-          ctx.log(`insertSlidesLocalImage: failed to delete intermediary Drive file ${fileId}`, err),
+          ctx.log(`insertSlidesLocalImage: failed to delete intermediary Drive file ${fileId}`, describeErrorForLog(err)),
         );
         return result;
       } catch (err) {
